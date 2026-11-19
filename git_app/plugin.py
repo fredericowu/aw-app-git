@@ -592,7 +592,10 @@ class GitAppPlugin:
                         {"has_work": False, "warming_up": True,
                          "error": "maintenance scan still running on this worker "
                                   "— retry shortly"},
-                        status_code=503,
+                        # 200, not 503: warming up is a healthy no-op, so the
+                        # dag http gate stops cleanly (has_work false) rather
+                        # than ending the cadence run in error.
+                        status_code=200,
                     )
                 cached = maintenance.get_cached()
 
