@@ -158,7 +158,7 @@ def test_cold_cache_slower_than_the_budget_answers_warming_up_not_a_hang(setup, 
     monkeypatch.setattr(app._maintenance, "poll", slow_poll)
 
     resp = tc.get("/github/maintenance")
-    assert resp.status_code == 503
+    assert resp.status_code == 200  # healthy no-op for the gate, not an error
     body = resp.json()
     assert body["warming_up"] is True
     assert body["has_work"] is False
