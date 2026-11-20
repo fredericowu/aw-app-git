@@ -1045,6 +1045,8 @@ class MaintenanceWatchdog:
                         published = float(current.get("order"))
                     except (TypeError, ValueError):
                         published = None
+                    if published is not None and not math.isfinite(published):
+                        published = None  # corrupt on-disk order: overwrite it
                     if published is not None and published >= snapshot["order"]:
                         return
                 save_surfaced_store(self._cache_path, snapshot)
