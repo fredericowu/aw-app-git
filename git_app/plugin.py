@@ -584,6 +584,8 @@ class GitAppPlugin:
                         for e in (cached.get("aw_run_attention") or [])
                         if aw_run_nudge.pr_key(e) not in applied
                         and aw_run_nudge.pr_key(e) in live_keys]
+            if not dry_run:
+                await aw_run_nudge.attach_live_labels(mgr + fallback, maintenance._gh_runner)
             block = aw_run_nudge.summarize(store, live_keys, applied, now_ts)
             block.update({"nudge": bool(nudge), "dry_run": bool(dry_run),
                           "error": outage, "dropped": outcome.get("dropped") or [],

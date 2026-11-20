@@ -113,13 +113,15 @@ def call_nudge(body: dict) -> dict:
 
 # ── live re-check ────────────────────────────────────────────────────────
 
-async def live_recheck(tagged: list, gh_runner, *, concurrency: int = gm.GH_MAX_CONCURRENCY) -> "tuple[list, list]":
+async def live_recheck(tagged: list, gh_runner, *, concurrency: int = gm.GH_MAX_CONCURRENCY,
+                       sink: "tuple[list, list] | None" = None) -> "tuple[list, list]":
     """``(still_open, dropped)``. Each kept PR gains ``head_sha`` and fresh
     ``labels`` (and ``run_id`` if the label moved). A PR whose state cannot be
     read is KEPT out of the nudge (it is neither woken nor handed over) and
     reported in ``dropped`` with the reason, never silently."""
-    still_open: list = []
-    dropped: list = []
+    # ``sink`` lets the caller keep the checks that finished if the batch is cut
+    # off by the shared deadline (one slow PR must not discard the others).
+    still_open, dropped = sink if sink is not None else ([], [])
 
     async def _one(pr: dict) -> None:
         code, out, err = await gh_runner(["pr", "view", pr["url"], "--json", REVIEW_FIELDS])
@@ -144,6 +146,29 @@ async def live_recheck(tagged: list, gh_runner, *, concurrency: int = gm.GH_MAX_
 
     await gm._bounded_gather(tagged, _one, concurrency=concurrency)
     return still_open, dropped
+
+
+async def attach_live_labels(entries: list, gh_runner, *, budget_s: float = 6.0) -> None:
+    """Set ``entry['aw_run']['labels']`` to the PR's live label names, read with
+    the gate's authenticated ``gh`` (the Manager's own ``gh`` is unauthenticated
+    and cannot see private PRs). ``None`` means the labels could not be read."""
+    for e in entries:
+        e.setdefault("aw_run", {})["labels"] = None
+
+    async def _one(e: dict) -> None:
+        code, out, _ = await gh_runner(["pr", "view", e["url"], "--json", "labels"])
+        if code != 0:
+            return
+        try:
+            e["aw_run"]["labels"] = gm.label_names(json.loads(out or "{}").get("labels"))
+        except ValueError:
+            pass
+
+    try:
+        await asyncio.wait_for(gm._bounded_gather(entries, _one, concurrency=gm.GH_MAX_CONCURRENCY),
+                               timeout=budget_s)
+    except asyncio.TimeoutError:
+        pass
 
 
 def _ident(pr: dict) -> dict:
@@ -299,12 +324,16 @@ async def run_nudge(*, tagged: list, gh_runner, store_path: str, now: "float | N
 
 
 async def _run_nudge(tagged, gh_runner, store_path, now, dry_run, client, started) -> dict:
+    still_open: list = []
+    dropped: list = []
     try:
-        still_open, dropped = await asyncio.wait_for(
-            live_recheck(tagged, gh_runner), timeout=LIVE_RECHECK_BUDGET_S)
+        await asyncio.wait_for(live_recheck(tagged, gh_runner, sink=(still_open, dropped)),
+                               timeout=LIVE_RECHECK_BUDGET_S)
     except asyncio.TimeoutError:
-        return {"error": f"live re-check exceeded {LIVE_RECHECK_BUDGET_S:.0f}s", "dropped": [],
-                "nudged": 0}
+        done = {pr_key(p) for p in still_open} | {pr_key(d) for d in dropped}
+        for p in tagged:
+            if pr_key(p) not in done:
+                dropped.append({**_ident(p), "reason": f"live re-check failed: exceeded {LIVE_RECHECK_BUDGET_S:.0f}s"})
     if dropped and not dry_run:
         # A merged/closed/untagged PR must not keep applying a stale verdict.
         with gm.locked_store(store_path):

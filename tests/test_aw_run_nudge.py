@@ -239,7 +239,8 @@ def test_previous_woken_verdict_does_not_hide_pr_during_nudge_outage(env):
     r2 = tc.get("/github/maintenance?limit=20").json()
     assert [p["number"] for p in r2["prs"]] == [7] and r2["has_work"] is True
     assert "AP-MT down" in r2["aw_run"]["error"]
-    assert r2["prs"][0]["aw_run"] == {"fallback": True}
+    assert r2["prs"][0]["aw_run"]["fallback"] is True
+    assert r2["prs"][0]["aw_run"]["labels"] == [f"aw-run:{RID}"]   # live, read by the gate
     # a later successful nudge clears the outage and replays verdicts again
     state["fail"] = None
     assert tc.get("/github/maintenance?nudge=true").json()["prs"] == []
@@ -282,6 +283,40 @@ def test_one_failed_recheck_does_not_hide_fresh_handoff_for_another_pr(env):
     assert "live re-check failed" in r2["aw_run"]["error"]
 
 
+def test_deadline_keeps_completed_checks_and_marks_only_unfinished(env, monkeypatch):
+    tc, app, state, _ = env
+    state["verdict"] = "needs_human_label"
+    monkeypatch.setattr(aw_run_nudge, "LIVE_RECHECK_BUDGET_S", 0.3)
+    _warm(app, tagged=[_tagged(7), _tagged(8)], attention=[_att(8)])
+    view = state["view"]
+
+    async def gh(args):
+        if args[2].endswith("/8"):
+            await asyncio.sleep(2)
+        return 0, json.dumps(view), ""
+    app._maintenance._gh_runner = gh
+    r = tc.get("/github/maintenance?nudge=true").json()
+    assert [c["prs"][0]["number"] for c in state["calls"]] == [7]
+    assert sorted(p["number"] for p in r["prs"]) == [7, 8]
+    assert all(p["aw_run"]["labels"] is not None for p in r["prs"] if p["number"] == 7)
+
+
+def test_handed_off_entries_carry_live_labels_or_null(env):
+    tc, app, state, _ = env
+    state["verdict"] = "escalate"
+    _warm(app, tagged=[_tagged()], attention=[_att()])
+    state["view"] = {"state": "OPEN", "headRefOid": "x",
+                     "labels": _lab(f"aw-run:{RID}", "devteam:needs-human")}
+    r = tc.get("/github/maintenance?nudge=true").json()
+    assert "devteam:needs-human" in r["prs"][0]["aw_run"]["labels"]
+
+    async def boom(args):
+        return 1, "", "no auth"
+    app._maintenance._gh_runner = boom
+    r2 = tc.get("/github/maintenance?limit=20").json()
+    assert r2["prs"][0]["aw_run"]["labels"] is None
+
+
 def test_call_exceeding_wall_clock_deadline_fails_open(env, monkeypatch):
     tc, app, state, _ = env
     monkeypatch.setattr(aw_run_nudge, "TIMEOUT_S", 1.0)
@@ -302,7 +337,7 @@ def test_slow_live_recheck_fails_open_within_budget(env, monkeypatch):
     app._maintenance._gh_runner = slow
     _warm(app, tagged=[_tagged()], attention=[_att()])
     r = tc.get("/github/maintenance?nudge=true").json()
-    assert "live re-check exceeded" in r["aw_run"]["error"] and not state["calls"]
+    assert "live re-check failed" in r["aw_run"]["error"] and not state["calls"]
     assert [p["number"] for p in r["prs"]] == [7]
 
 
