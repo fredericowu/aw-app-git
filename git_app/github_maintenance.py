@@ -1041,12 +1041,12 @@ class MaintenanceWatchdog:
             with locked_store(self._cache_path):
                 current = load_surfaced_store(self._cache_path)
                 if current.get("boot_id") == snapshot.get("boot_id"):
-                    try:
-                        published = float(current.get("order"))
-                    except (TypeError, ValueError):
+                    published = current.get("order")
+                    # same validity rule as the reader (_adopt): real finite
+                    # number only; anything else is corrupt -> overwrite it
+                    if (isinstance(published, bool) or not isinstance(published, (int, float))
+                            or not math.isfinite(published)):
                         published = None
-                    if published is not None and not math.isfinite(published):
-                        published = None  # corrupt on-disk order: overwrite it
                     if published is not None and published >= snapshot["order"]:
                         return
                 save_surfaced_store(self._cache_path, snapshot)
