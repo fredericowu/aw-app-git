@@ -263,6 +263,25 @@ def test_failed_live_recheck_keeps_outage_for_manager_reread(env):
     assert [p["number"] for p in r2["prs"]] == [7] and r2["has_work"] is True
 
 
+def test_one_failed_recheck_does_not_hide_fresh_handoff_for_another_pr(env):
+    tc, app, state, _ = env
+    state["verdict"] = "needs_human_label"
+    _warm(app, tagged=[_tagged(7), _tagged(8)], attention=[_att(8)])
+    base_view = state["view"]
+
+    async def gh(args):
+        if args[2].endswith("/8"):
+            return 1, "", "gh: boom"
+        return 0, json.dumps(base_view), ""
+    app._maintenance._gh_runner = gh
+    r = tc.get("/github/maintenance?nudge=true").json()
+    assert sorted(p["number"] for p in r["prs"]) == [7, 8]
+    assert [c["body"] if False else c["prs"][0]["number"] for c in state["calls"]] == [7]
+    r2 = tc.get("/github/maintenance?limit=20").json()
+    assert sorted(p["number"] for p in r2["prs"]) == [7, 8]
+    assert "live re-check failed" in r2["aw_run"]["error"]
+
+
 def test_call_exceeding_wall_clock_deadline_fails_open(env, monkeypatch):
     tc, app, state, _ = env
     monkeypatch.setattr(aw_run_nudge, "TIMEOUT_S", 1.0)

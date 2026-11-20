@@ -196,12 +196,12 @@ def _outage_path(store_path: str) -> str:
     return store_path + ".outage"
 
 
-def mark_outage(store_path: str, now: float, reason: str) -> None:
+def mark_outage(store_path: str, now: float, reason: str, keys: "list | None" = None) -> None:
     """Persist that the last ``nudge=true`` failed, so the Manager's plain
     re-read does not replay a pre-outage verdict that hides a PR."""
     try:
         with open(_outage_path(store_path), "w") as fh:
-            json.dump({"at": now, "reason": reason}, fh)
+            json.dump({"at": now, "reason": reason, "keys": keys}, fh)
     except OSError:
         log.warning("could not persist aw-run outage marker", exc_info=True)
 
@@ -215,15 +215,18 @@ def clear_outage(store_path: str) -> None:
         log.warning("could not clear aw-run outage marker", exc_info=True)
 
 
-def recent_outage(store_path: str, now: float) -> "str | None":
-    """Reason of the last failed nudge if no successful one has cleared it
-    (and it is younger than :data:`VERDICT_TTL_S`), else ``None``."""
+def recent_outage(store_path: str, now: float) -> "dict | None":
+    """``{reason, keys}`` of the last failed nudge if no clean one has cleared
+    it (and it is younger than :data:`VERDICT_TTL_S`), else ``None``. ``keys``
+    is ``None`` for a whole-call failure, or the PRs whose live re-check failed."""
     try:
         with open(_outage_path(store_path)) as fh:
             data = json.load(fh)
         if now - float(data.get("at") or 0) > VERDICT_TTL_S:
             return None
-        return str(data.get("reason") or "nudge failed")
+        keys = data.get("keys")
+        return {"reason": str(data.get("reason") or "nudge failed"),
+                "keys": None if keys is None else [str(k) for k in keys]}
     except (OSError, ValueError, TypeError, AttributeError):
         return None
 
@@ -280,14 +283,16 @@ async def run_nudge(*, tagged: list, gh_runner, store_path: str, now: "float | N
     now = now if now is not None else time.time()
     started = time.monotonic()
     result = await _run_nudge(tagged, gh_runner, store_path, now, dry_run, client, started)
-    unverified = [d for d in result.get("dropped") or [] if str(d.get("reason", "")).startswith("live re-check")]
-    if unverified and not result.get("error"):
-        # A PR whose live state could not be read is not a confirmed closure:
-        # keep the fail-open decision (and the outage marker) for the Manager.
-        result["error"] = f"live re-check failed for {len(unverified)} PR(s): {unverified[0]['reason']}"
+    # A PR whose live state could not be read is not a confirmed closure, but it
+    # must not blind the rest of the batch: only those PRs fail open.
+    unverified = sorted({pr_key(d) for d in result.get("dropped") or []
+                         if str(d.get("reason", "")).startswith("live re-check")})
+    result["unverified"] = unverified
     if not dry_run:
         if result.get("error"):
             mark_outage(store_path, now, result["error"])
+        elif unverified:
+            mark_outage(store_path, now, f"live re-check failed for {len(unverified)} PR(s)", unverified)
         else:
             clear_outage(store_path)
     return result

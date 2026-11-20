@@ -569,11 +569,17 @@ class GitAppPlugin:
             # A nudge outage must not let a previous verdict keep hiding PRs that
             # may need the Manager now: fail open to the ordinary attention filter.
             # The marker persists the outage for the Manager's plain re-read.
-            outage = outcome.get("error") or aw_run_nudge.recent_outage(store_path, now_ts)
-            if outage:
-                mgr, applied = [], set()
-            else:
-                mgr, applied = aw_run_nudge.manager_prs(store, live_keys, now_ts)
+            marker = aw_run_nudge.recent_outage(store_path, now_ts)
+            outage = outcome.get("error") or (marker or {}).get("reason")
+            if outcome.get("error") or (marker and marker["keys"] is None):
+                blind = set(live_keys)           # whole-call failure: every PR fails open
+            else:                                # only the PRs whose re-check failed
+                blind = set(outcome.get("unverified") or []) | set((marker or {}).get("keys") or [])
+            if not nudge and marker and marker["keys"] is not None and not outcome.get("error"):
+                outage = marker["reason"]
+            elif outcome.get("unverified") and not outcome.get("error"):
+                outage = f"live re-check failed for {len(blind)} PR(s)"
+            mgr, applied = aw_run_nudge.manager_prs(store, live_keys - blind, now_ts)
             fallback = [{**e, "aw_run": {"fallback": True}}
                         for e in (cached.get("aw_run_attention") or [])
                         if aw_run_nudge.pr_key(e) not in applied
