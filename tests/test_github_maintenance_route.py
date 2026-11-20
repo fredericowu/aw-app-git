@@ -52,6 +52,8 @@ def setup(tmp_path, monkeypatch):
     notify_calls = []
     ctx.has = lambda cap: True
     ctx.notify = lambda **kw: notify_calls.append(kw) or {"ok": True}
+    monkeypatch.setattr(github_maintenance, "default_cache_path",
+                        lambda: str(tmp_path / "cache.json"))
     app = plugin.GitAppPlugin()
     api = app._build_routes(ctx)
     return TestClient(api), app, ctx, notify_calls
@@ -158,10 +160,10 @@ def test_cold_cache_slower_than_the_budget_answers_warming_up_not_a_hang(setup, 
     monkeypatch.setattr(app._maintenance, "poll", slow_poll)
 
     resp = tc.get("/github/maintenance")
-    assert resp.status_code == 200  # healthy no-op for the gate, not an error
+    assert resp.status_code == 503  # loud failure: never a silent has_work=false
     body = resp.json()
     assert body["warming_up"] is True
-    assert body["has_work"] is False
+    assert "has_work" not in body
 
 
 def test_cold_cache_two_concurrent_requests_share_one_scan(setup, monkeypatch):
@@ -490,3 +492,81 @@ def test_locked_store_serializes_two_sequential_read_modify_writes(tmp_path):
         github_maintenance.save_surfaced_store(path, state)
 
     assert github_maintenance.load_surfaced_store(path)["seen"] == ["a", "b"]
+
+
+# ---- cross-worker shared cache (card 41e5bf3b) --------------------------
+
+def test_cold_worker_adopts_the_leaders_shared_snapshot_not_warming_up(setup, tmp_path, monkeypatch):
+    import time
+    tc, app, _, _ = setup
+    github_maintenance.save_surfaced_store(str(tmp_path / "cache.json"), {
+        "prs": [], "failing_flows": [_flow()], "counts": {"scanned_repos": 3},
+        "errors": [], "last_poll": time.time() - 60, "error": None})
+
+    def boom():  # must not scan: the snapshot answers
+        raise AssertionError("cold worker re-scanned despite a fresh snapshot")
+    monkeypatch.setattr(app._maintenance, "poll_task", boom)
+
+    resp = tc.get("/github/maintenance")
+    assert resp.status_code == 200
+    assert resp.json()["has_work"] is True
+
+
+def test_stale_shared_snapshot_is_not_trusted(setup, tmp_path):
+    import time
+    _, app, _, _ = setup
+    github_maintenance.save_surfaced_store(str(tmp_path / "cache.json"), {
+        "prs": [], "failing_flows": [_flow()], "counts": {}, "errors": [],
+        "last_poll": time.time() - github_maintenance.SHARED_CACHE_MAX_AGE_S - 10, "error": None})
+    assert app._maintenance.get_cached()["last_poll"] == 0
+
+
+def test_poll_persists_a_snapshot_other_workers_can_adopt(tmp_path, monkeypatch):
+    path = str(tmp_path / "cache.json")
+
+    async def fake_scan(**kw):
+        return {"prs": [], "failing_flows": [_flow()], "counts": {"scanned_repos": 1}, "errors": []}
+    monkeypatch.setattr(github_maintenance, "scan_maintenance", fake_scan)
+    leader = github_maintenance.MaintenanceWatchdog(cache_path=path)
+    asyncio.run(leader.poll())
+    follower = github_maintenance.MaintenanceWatchdog(cache_path=path)
+    cached = follower.get_cached()
+    assert cached["last_poll"] > 0 and len(cached["failing_flows"]) == 1
+
+
+def test_failed_poll_does_not_overwrite_the_snapshot(tmp_path, monkeypatch):
+    path = str(tmp_path / "cache.json")
+
+    async def bad_scan(**kw):
+        raise RuntimeError("gh down")
+    monkeypatch.setattr(github_maintenance, "scan_maintenance", bad_scan)
+    github_maintenance.save_surfaced_store(path, {"last_poll": 5.0, "prs": [], "failing_flows": []})
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll())
+    assert github_maintenance.load_surfaced_store(path)["last_poll"] == 5.0
+
+
+def test_adopted_snapshot_restores_aw_run_prs_for_the_nudge(tmp_path):
+    import time
+    path = str(tmp_path / "cache.json")
+    tagged = {"repo": "o/r", "number": 7, "url": "https://github.com/o/r/pull/7"}
+    github_maintenance.save_surfaced_store(path, {
+        "prs": [], "aw_run_prs": [tagged], "aw_run_attention": [tagged],
+        "failing_flows": [], "counts": {}, "errors": [],
+        "last_poll": time.time() - 5, "error": None})
+    cached = github_maintenance.MaintenanceWatchdog(cache_path=path).get_cached()
+    assert cached["aw_run_prs"] == [tagged] and cached["aw_run_attention"] == [tagged]
+
+
+def test_adopted_snapshot_expires_on_the_same_worker(tmp_path, monkeypatch):
+    import time
+    path = str(tmp_path / "cache.json")
+    now = time.time()
+    github_maintenance.save_surfaced_store(path, {
+        "prs": [], "failing_flows": [_flow()], "counts": {}, "errors": [],
+        "last_poll": now - 10, "error": None})
+    wd = github_maintenance.MaintenanceWatchdog(cache_path=path)
+    assert wd.get_cached()["last_poll"] > 0
+    monkeypatch.setattr(github_maintenance.time, "time",
+                        lambda: now + github_maintenance.SHARED_CACHE_MAX_AGE_S + 60)
+    cached = wd.get_cached()
+    assert cached["last_poll"] == 0 and cached["failing_flows"] == []

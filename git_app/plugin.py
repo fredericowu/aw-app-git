@@ -362,7 +362,8 @@ class GitAppPlugin:
         if existing is not None:
             return existing
         self._maintenance = github_maintenance.MaintenanceWatchdog(
-            scope_fn=lambda: _maintenance_scope(ctx))
+            scope_fn=lambda: _maintenance_scope(ctx),
+            cache_path=github_maintenance.default_cache_path())
         return self._maintenance
 
     def _build_routes(self, ctx):
@@ -652,13 +653,16 @@ class GitAppPlugin:
                     )
                 except asyncio.TimeoutError:
                     return JSONResponse(
-                        {"has_work": False, "warming_up": True,
+                        # No has_work key on purpose (card 41e5bf3b): a
+                        # gate reading has_work must not see a clean "false".
+                        {"warming_up": True,
                          "error": "maintenance scan still running on this worker "
                                   "— retry shortly"},
-                        # 200, not 503: warming up is a healthy no-op, so the
-                        # dag http gate stops cleanly (has_work false) rather
-                        # than ending the cadence run in error.
-                        status_code=200,
+                        # 503, not 200 (card 41e5bf3b): a 200 here made the
+                        # dag http gate read warming_up as has_work=false and
+                        # silently skip the tick. Non-2xx fails the gate
+                        # loudly, like the broken-scan 502 below.
+                        status_code=503,
                     )
                 cached = maintenance.get_cached()
 
