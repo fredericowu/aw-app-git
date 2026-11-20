@@ -989,7 +989,17 @@ class MaintenanceWatchdog:
         if not self._cache_path:
             return
         try:
-            save_surfaced_store(self._cache_path, dict(self._cache))
+            # Newer-wins under the cross-process lock: a slow older scan must
+            # not overwrite a newer snapshot another worker already published.
+            with locked_store(self._cache_path):
+                current = load_surfaced_store(self._cache_path)
+                try:
+                    published = float(current.get("last_poll") or 0)
+                except (TypeError, ValueError):
+                    published = 0.0
+                if published >= float(self._cache.get("last_poll") or 0):
+                    return
+                save_surfaced_store(self._cache_path, dict(self._cache))
         except Exception as e:  # never break the poll over the snapshot
             log.warning("github maintenance shared cache write failed: %s", e)
 

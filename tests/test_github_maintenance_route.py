@@ -570,3 +570,22 @@ def test_adopted_snapshot_expires_on_the_same_worker(tmp_path, monkeypatch):
                         lambda: now + github_maintenance.SHARED_CACHE_MAX_AGE_S + 60)
     cached = wd.get_cached()
     assert cached["last_poll"] == 0 and cached["failing_flows"] == []
+
+
+def test_older_scan_does_not_overwrite_a_newer_shared_snapshot(tmp_path, monkeypatch):
+    path = str(tmp_path / "cache.json")
+    clock = {"t": 2000.0}
+    monkeypatch.setattr(github_maintenance.time, "time", lambda: clock["t"])
+
+    async def scan_with_work(**kw):
+        return {"prs": [_pr()], "failing_flows": [], "counts": {}, "errors": []}
+
+    async def scan_empty(**kw):
+        return {"prs": [], "failing_flows": [], "counts": {}, "errors": []}
+    # newer scan (t=2000) publishes first, then an older one (t=1000) finishes
+    monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_with_work)
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=2000.0))
+    monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_empty)
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=1000.0))
+    snap = github_maintenance.load_surfaced_store(path)
+    assert snap["last_poll"] == 2000.0 and len(snap["prs"]) == 1
