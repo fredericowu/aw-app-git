@@ -345,3 +345,146 @@ def test_client_timeout_stays_above_runners_proxy_timeout():
     assert aw_run_nudge.TIMEOUT_S >= 15 + 2
     assert aw_run_nudge.LIVE_RECHECK_BUDGET_S + aw_run_nudge.TIMEOUT_S < 30
     assert aw_run_nudge.TOTAL_DEADLINE_S < 30
+
+
+# ── facts for AP-MT's deterministic decision (Kanban 41e5bf3b, PR 2) ─────
+
+def _chk(name, status="COMPLETED", conclusion="SUCCESS"):
+    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion}
+
+
+def _ctx(context, state="SUCCESS"):
+    return {"__typename": "StatusContext", "context": context, "state": state}
+
+
+def test_ci_ignores_advisory_contexts_incl_reusable_job_tail():
+    roll = [_chk("test"), _ctx("devteam/code-review", "FAILURE"), _ctx("devteam/review-cap", "FAILURE"),
+            _chk("review / code-review", conclusion="FAILURE"), _chk("merge-attempt", conclusion="CANCELLED")]
+    assert aw_run_nudge.derive_ci(roll) == "green"
+
+
+def test_ci_red_pending_green_unknown():
+    assert aw_run_nudge.derive_ci([_chk("test", conclusion="FAILURE")]) == "red"
+    assert aw_run_nudge.derive_ci([_chk("test", status="IN_PROGRESS", conclusion="")]) == "pending"
+    assert aw_run_nudge.derive_ci([_ctx("ci/x", "PENDING")]) == "pending"
+    assert aw_run_nudge.derive_ci([_chk("test"), _chk("lint", conclusion="SKIPPED")]) == "green"
+    assert aw_run_nudge.derive_ci([_chk("a", conclusion="FAILURE"), _chk("b", status="QUEUED", conclusion="")]) == "red"
+    assert aw_run_nudge.derive_ci(None) == "unknown"
+
+
+def test_merge_eligible_only_on_success_status():
+    assert aw_run_nudge.merge_eligible([_ctx("devteam/merge-eligible")]) is True
+    assert aw_run_nudge.merge_eligible([_ctx("devteam/merge-eligible", "FAILURE")]) is False
+    assert aw_run_nudge.merge_eligible([_chk("devteam/merge-eligible")]) is False
+    assert aw_run_nudge.merge_eligible(None) is False
+
+
+def _ev(label, login, typ="User", event="labeled"):
+    return {"event": event, "label": {"name": label}, "actor": {"login": login, "type": typ}}
+
+
+def test_needs_human_actor_uses_the_last_labeling_event():
+    bot = _ev("devteam:needs-human", "github-actions[bot]", "Bot")
+    human = _ev("devteam:needs-human", "fredericowu")
+    assert aw_run_nudge.needs_human_actor([bot]) == "bot"
+    assert aw_run_nudge.needs_human_actor([bot, human]) == "human"
+    assert aw_run_nudge.needs_human_actor([human, bot]) == "bot"
+    assert aw_run_nudge.needs_human_actor([_ev("other", "x")]) == "unknown"
+    assert aw_run_nudge.needs_human_actor([{"event": "labeled", "label": {"name": "devteam:needs-human"},
+                                            "actor": None}]) == "unknown"
+    assert aw_run_nudge.needs_human_actor([]) == "unknown"
+
+
+def test_parse_json_arrays_handles_paginated_output():
+    assert aw_run_nudge.parse_json_arrays('[{"a":1}]\n[{"a":2}]') == [{"a": 1}, {"a": 2}]
+    assert aw_run_nudge.parse_json_arrays("") == []
+
+
+def _view(labels, **kw):
+    v = {"state": "OPEN", "headRefOid": "abc123", "labels": _lab(*labels), "isDraft": False,
+         "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+         "statusCheckRollup": [_chk("test"), _ctx("devteam/code-review", "FAILURE")]}
+    v.update(kw)
+    return v
+
+
+def _recheck(view, events=None, events_code=0):
+    calls: list = []
+
+    async def gh(args):
+        calls.append(args)
+        if args[:2] == ["pr", "view"]:
+            return 0, json.dumps(view), ""
+        if args[0] == "api":
+            return events_code, json.dumps(events or []), "boom" if events_code else ""
+        return 1, "", "unexpected"
+    pr = {"repo": "o/r", "number": 6, "url": "https://github.com/o/r/pull/6", "title": "t"}
+    kept, dropped = asyncio.run(aw_run_nudge.live_recheck([pr], gh))
+    return kept, dropped, calls
+
+
+def test_facts_for_a_clean_green_pr_and_no_timeline_read():
+    kept, dropped, calls = _recheck(_view([f"aw-run:{RID}", "devteam:review-capped"]))
+    assert not dropped
+    assert kept[0]["facts"] == {"ci": "green", "mergeable": "MERGEABLE", "merge_state": "CLEAN",
+                                "merge_eligible": False, "draft": False, "needs_human_by": "unknown"}
+    assert not [c for c in calls if c[0] == "api"], "timeline must only be read for needs-human PRs"
+
+
+def test_facts_merge_eligible_and_red_ci():
+    v = _view([f"aw-run:{RID}"], statusCheckRollup=[_chk("test", conclusion="FAILURE"),
+                                                   _ctx("devteam/merge-eligible")])
+    kept, _, _ = _recheck(v)
+    assert kept[0]["facts"]["ci"] == "red" and kept[0]["facts"]["merge_eligible"] is True
+
+
+def test_needs_human_pr_reads_the_timeline_once_and_reports_actor():
+    ev = [_ev("devteam:needs-human", "github-actions[bot]", "Bot")]
+    kept, _, calls = _recheck(_view([f"aw-run:{RID}", "devteam:needs-human"]), ev)
+    assert kept[0]["facts"]["needs_human_by"] == "bot"
+    api = [c for c in calls if c[0] == "api"]
+    assert len(api) == 1 and "repos/o/r/issues/6/events" in api[0][-1]
+    kept, _, _ = _recheck(_view([f"aw-run:{RID}", "devteam:needs-human"]), [_ev("devteam:needs-human", "frederico")])
+    assert kept[0]["facts"]["needs_human_by"] == "human"
+
+
+def test_unreadable_timeline_is_unknown_not_bot():
+    kept, _, _ = _recheck(_view([f"aw-run:{RID}", "devteam:needs-human"]), events_code=1)
+    assert kept[0]["facts"]["needs_human_by"] == "unknown"
+
+
+def test_facts_are_sent_to_ap_mt_and_draft_flag_propagates():
+    sent: list = []
+
+    def client(body):
+        sent.append(body)
+        return {"verdicts": [{"repo": "o/r", "number": 6, "verdict": "woken", "action": "rereview"}]}
+
+    async def gh(args):
+        return 0, json.dumps(_view([f"aw-run:{RID}"], isDraft=True)), ""
+    pr = {"repo": "o/r", "number": 6, "url": "https://github.com/o/r/pull/6", "title": "t"}
+    res = asyncio.run(aw_run_nudge.run_nudge(tagged=[pr], gh_runner=gh, store_path="/nonexistent/x.json",
+                                             dry_run=True, client=client))
+    assert res["error"] is None
+    assert sent[0]["prs"][0]["facts"]["draft"] is True
+    assert sent[0]["prs"][0]["facts"]["ci"] == "green"
+
+
+def test_hand_to_manager_flag_from_ap_mt_wins_over_the_verdict_name():
+    tagged = [{"repo": "o/r", "number": n, "url": f"u{n}", "run_id": RID, "updated_at": "2026-11-20T00:00:00Z"}
+              for n in (1, 2, 3, 4)]
+    verdicts = [
+        {"repo": "o/r", "number": 1, "verdict": "ask_unroutable", "hand_to_manager": True},
+        {"repo": "o/r", "number": 2, "verdict": "asked", "hand_to_manager": False},
+        {"repo": "o/r", "number": 3, "verdict": "needs_human_label", "hand_to_manager": False},
+        {"repo": "o/r", "number": 4, "verdict": "unresolvable"},  # old AP-MT: name fallback
+    ]
+    store = aw_run_nudge.plan_nudge_result(tagged, verdicts, {}, time.time())
+    assert store["o/r#1"]["handed_off"] is True
+    assert store["o/r#2"]["handed_off"] is False
+    assert store["o/r#3"]["handed_off"] is False
+    assert store["o/r#4"]["handed_off"] is True
+
+
+def test_bot_detected_by_actor_type_alone():
+    assert aw_run_nudge.needs_human_actor([_ev("devteam:needs-human", "devteam-app", "Bot")]) == "bot"

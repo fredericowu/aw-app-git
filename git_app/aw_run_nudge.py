@@ -53,9 +53,23 @@ STORE_REL = "data/git/github_maintenance_aw_run.json"
 #: attention filter rather than staying hidden on a dead verdict.
 VERDICT_TTL_S = 6 * 3600.0
 
+#: Fallback for an AP-MT that predates the per-verdict ``hand_to_manager`` flag.
 HAND_TO_MANAGER = frozenset({"escalate", "unresolvable", "needs_human_label", "stuck_active"})
 
-REVIEW_FIELDS = "state,headRefOid,labels,isDraft"
+REVIEW_FIELDS = "state,headRefOid,labels,isDraft,mergeable,mergeStateStatus,statusCheckRollup"
+
+NEEDS_HUMAN_LABEL = "devteam:needs-human"
+MERGE_ELIGIBLE_CONTEXT = "devteam/merge-eligible"
+#: The shared workflow's own contexts (code-review-reusable.yml, merge-attempt's
+#: ADVISORY set). They never gate a merge through raw pass/fail, so a red one
+#: must not make ``ci`` red. Matched on the full name and on the segment after
+#: the last ``/`` (a reusable job reports as "<caller job> / <job>").
+ADVISORY_CONTEXTS = frozenset({
+    "devteam/ai-review", "devteam/code-review", "devteam/merge-eligible",
+    "devteam/provenance", "devteam/review-cap",
+    "ai-review", "code-review", "merge-eligible", "provenance-gate", "gate",
+    "fork-notice", "merged-event", "merge-attempt", "CodeRabbit",
+})
 
 
 class NudgeError(RuntimeError):
@@ -111,6 +125,123 @@ def call_nudge(body: dict) -> dict:
     return data
 
 
+# ── facts for the AP-MT decision ─────────────────────────────────────────
+
+def _is_advisory(name: str) -> bool:
+    name = (name or "").strip()
+    return name in ADVISORY_CONTEXTS or name.rsplit("/", 1)[-1].strip() in ADVISORY_CONTEXTS
+
+
+def _rollup_entry(e: dict) -> "tuple[str, str]":
+    """``(name, outcome)`` with outcome in green/red/pending for a check run or
+    a commit status."""
+    if e.get("__typename") == "StatusContext" or "context" in e:
+        name = e.get("context") or ""
+        state = (e.get("state") or "").upper()
+        if state == "SUCCESS":
+            return name, "green"
+        if state in ("PENDING", "EXPECTED"):
+            return name, "pending"
+        return name, "red"
+    name = e.get("name") or ""
+    if (e.get("status") or "").upper() != "COMPLETED":
+        return name, "pending"
+    conclusion = (e.get("conclusion") or "").upper()
+    if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+        return name, "green"
+    return name, "red"
+
+
+def derive_ci(rollup) -> str:
+    """green / red / pending / unknown over the NON-advisory checks only.
+    No non-advisory check at all is green: ``mergeable``/``merge_state`` still
+    has to be CLEAN, which is where required checks show up."""
+    if rollup is None:
+        return "unknown"
+    seen = {"green": 0, "red": 0, "pending": 0}
+    for e in rollup:
+        if not isinstance(e, dict):
+            continue
+        name, outcome = _rollup_entry(e)
+        if _is_advisory(name):
+            continue
+        seen[outcome] += 1
+    if seen["red"]:
+        return "red"
+    if seen["pending"]:
+        return "pending"
+    return "green"
+
+
+def merge_eligible(rollup) -> bool:
+    for e in rollup or []:
+        if isinstance(e, dict) and e.get("context") == MERGE_ELIGIBLE_CONTEXT \
+                and (e.get("state") or "").upper() == "SUCCESS":
+            return True
+    return False
+
+
+def parse_json_arrays(text: str) -> list:
+    """``gh api --paginate`` prints one JSON array per page, back to back."""
+    out: list = []
+    dec = json.JSONDecoder()
+    i, n = 0, len(text or "")
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        val, i = dec.raw_decode(text, i)
+        out.extend(val if isinstance(val, list) else [val])
+    return out
+
+
+def needs_human_actor(events: list) -> str:
+    """bot / human / unknown: who applied the CURRENT ``devteam:needs-human``
+    (the last ``labeled`` event for it). Anything unreadable is ``unknown``,
+    which AP-MT treats like a human."""
+    last = None
+    for ev in events:
+        if isinstance(ev, dict) and ev.get("event") == "labeled" \
+                and (ev.get("label") or {}).get("name") == NEEDS_HUMAN_LABEL:
+            last = ev
+    actor = (last or {}).get("actor") or {}
+    login = actor.get("login") or ""
+    if not login:
+        return "unknown"
+    if actor.get("type") == "Bot" or login.endswith("[bot]"):
+        return "bot"
+    return "human"
+
+
+async def read_needs_human_by(pr: dict, gh_runner) -> str:
+    repo, number = pr.get("repo"), pr.get("number")
+    if not repo or not number:
+        return "unknown"
+    code, out, _ = await gh_runner(
+        ["api", "--paginate", f"repos/{repo}/issues/{number}/events?per_page=100"])
+    if code != 0:
+        return "unknown"
+    try:
+        return needs_human_actor(parse_json_arrays(out))
+    except ValueError:
+        return "unknown"
+
+
+def build_facts(view: dict, labels: list, needs_human_by: "str | None") -> dict:
+    """The ``facts`` block AP-MT's ``decide()`` consumes (PR 1 of card 41e5bf3b).
+    ``needs_human_by`` is only read for a PR that carries the label."""
+    rollup = view.get("statusCheckRollup")
+    return {
+        "ci": derive_ci(rollup if isinstance(rollup, list) else None),
+        "mergeable": view.get("mergeable") or "",
+        "merge_state": view.get("mergeStateStatus") or "",
+        "merge_eligible": merge_eligible(rollup if isinstance(rollup, list) else None),
+        "draft": bool(view.get("isDraft")),
+        "needs_human_by": needs_human_by or "unknown",
+    }
+
+
 # ── live re-check ────────────────────────────────────────────────────────
 
 async def live_recheck(tagged: list, gh_runner, *, concurrency: int = gm.GH_MAX_CONCURRENCY,
@@ -141,8 +272,11 @@ async def live_recheck(tagged: list, gh_runner, *, concurrency: int = gm.GH_MAX_
         if not run_id:
             dropped.append({**_ident(pr), "reason": "aw-run label removed"})
             return
+        # Timeline only for a PR that is labelled needs-human: it is the one
+        # extra call per PR, and the only row that needs the actor.
+        by = await read_needs_human_by(pr, gh_runner) if NEEDS_HUMAN_LABEL in labels else None
         still_open.append({**pr, "head_sha": view.get("headRefOid") or "", "labels": labels,
-                           "run_id": run_id})
+                           "run_id": run_id, "facts": build_facts(view, labels, by)})
 
     await gm._bounded_gather(tagged, _one, concurrency=concurrency)
     return still_open, dropped
@@ -208,7 +342,8 @@ def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> 
                  "stamp": prior.get("stamp"), "handed_off": False,
                  "repo": v.get("repo"), "number": v.get("number"), "url": v.get("url") or pr.get("url"),
                  "title": pr.get("title"), "updated_at": pr.get("updated_at")}
-        if verdict in HAND_TO_MANAGER:
+        flag = v.get("hand_to_manager")
+        if flag if flag is not None else verdict in HAND_TO_MANAGER:
             state = gm.surfaced_backoff_state(pr.get("updated_at"), prior.get("stamp"), now)
             if state == "eligible":
                 entry["handed_off"] = True
@@ -346,7 +481,8 @@ async def _run_nudge(tagged, gh_runner, store_path, now, dry_run, client, starte
         return {"error": None, "dropped": dropped, "nudged": 0}
     body = {"prs": [{"repo": p["repo"], "number": p["number"], "url": p["url"],
                      "title": p.get("title") or "", "run_id": p["run_id"],
-                     "head_sha": p.get("head_sha") or "", "labels": p.get("labels") or []}
+                     "head_sha": p.get("head_sha") or "", "labels": p.get("labels") or [],
+                     "facts": p.get("facts") or None}
                     for p in still_open],
             "dry_run": dry_run}
     remaining = min(TIMEOUT_S, TOTAL_DEADLINE_S - (time.monotonic() - started))
