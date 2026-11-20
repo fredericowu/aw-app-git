@@ -367,6 +367,14 @@ def default_store_path() -> str:
     return os.path.join(home, STORE_REL)
 
 
+def _boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
 def default_cache_path() -> str:
     home = os.environ.get("AW_WORKSPACE_HOME") or os.path.expanduser("~/.aw-workspace")
     return os.path.join(home, CACHE_REL)
@@ -976,7 +984,9 @@ class MaintenanceWatchdog:
             return
         if last <= float(self._cache.get("last_poll") or 0):
             return
-        if time.time() - last > SHARED_CACHE_MAX_AGE_S or snap.get("error") is not None:
+        age = time.time() - last
+        # negative age = clock moved backward since publish: don't trust it
+        if age > SHARED_CACHE_MAX_AGE_S or age < -60 or snap.get("error") is not None:
             return
         for key in ("prs", "aw_run_prs", "aw_run_attention", "failing_flows", "counts", "errors"):
             if key in snap:
@@ -985,21 +995,24 @@ class MaintenanceWatchdog:
         self._cache["last_poll"] = last
         self._adopted = True
 
-    def _persist_shared_cache(self) -> None:
+    def _persist_shared_cache(self, snapshot: dict) -> None:
+        """Blocking (flock + file IO): call via ``asyncio.to_thread``.
+        Newer-wins under the cross-process lock, ordered by the scan's
+        monotonic start stamp (+ boot_id), NOT wall-clock, so a clock
+        adjustment can neither block nor reorder publication."""
         if not self._cache_path:
             return
         try:
-            # Newer-wins under the cross-process lock: a slow older scan must
-            # not overwrite a newer snapshot another worker already published.
             with locked_store(self._cache_path):
                 current = load_surfaced_store(self._cache_path)
-                try:
-                    published = float(current.get("last_poll") or 0)
-                except (TypeError, ValueError):
-                    published = 0.0
-                if published >= float(self._cache.get("last_poll") or 0):
-                    return
-                save_surfaced_store(self._cache_path, dict(self._cache))
+                if current.get("boot_id") == snapshot.get("boot_id"):
+                    try:
+                        published = float(current.get("order"))
+                    except (TypeError, ValueError):
+                        published = None
+                    if published is not None and published >= snapshot["order"]:
+                        return
+                save_surfaced_store(self._cache_path, snapshot)
         except Exception as e:  # never break the poll over the snapshot
             log.warning("github maintenance shared cache write failed: %s", e)
 
@@ -1021,8 +1034,9 @@ class MaintenanceWatchdog:
             self._inflight = asyncio.ensure_future(self.poll())
         return self._inflight
 
-    async def poll(self, now: "float | None" = None) -> None:
+    async def poll(self, now: "float | None" = None, order: "float | None" = None) -> None:
         now = now if now is not None else time.time()
+        order = order if order is not None else time.monotonic()
         try:
             scope = self._scope_fn() if self._scope_fn is not None else None
             result = await scan_maintenance(
@@ -1044,7 +1058,8 @@ class MaintenanceWatchdog:
         self._cache["last_poll"] = now
         self._adopted = False
         if self._cache["error"] is None:
-            self._persist_shared_cache()
+            snapshot = dict(self._cache, order=order, boot_id=_boot_id())
+            await asyncio.to_thread(self._persist_shared_cache, snapshot)
 
 
 __all__ = [

@@ -574,18 +574,78 @@ def test_adopted_snapshot_expires_on_the_same_worker(tmp_path, monkeypatch):
 
 def test_older_scan_does_not_overwrite_a_newer_shared_snapshot(tmp_path, monkeypatch):
     path = str(tmp_path / "cache.json")
-    clock = {"t": 2000.0}
-    monkeypatch.setattr(github_maintenance.time, "time", lambda: clock["t"])
 
     async def scan_with_work(**kw):
         return {"prs": [_pr()], "failing_flows": [], "counts": {}, "errors": []}
 
     async def scan_empty(**kw):
         return {"prs": [], "failing_flows": [], "counts": {}, "errors": []}
-    # newer scan (t=2000) publishes first, then an older one (t=1000) finishes
+    # newer scan (order 2000) publishes first, then an older one (order 1000)
     monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_with_work)
-    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=2000.0))
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(order=2000.0))
     monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_empty)
-    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=1000.0))
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(order=1000.0))
     snap = github_maintenance.load_surfaced_store(path)
-    assert snap["last_poll"] == 2000.0 and len(snap["prs"]) == 1
+    assert snap["order"] == 2000.0 and len(snap["prs"]) == 1
+
+
+def test_backward_wall_clock_does_not_block_a_later_scan_from_publishing(tmp_path, monkeypatch):
+    path = str(tmp_path / "cache.json")
+
+    async def scan_empty(**kw):
+        return {"prs": [], "failing_flows": [], "counts": {}, "errors": []}
+
+    async def scan_with_work(**kw):
+        return {"prs": [_pr()], "failing_flows": [], "counts": {}, "errors": []}
+    monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_empty)
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=2000.0, order=10.0))
+    monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_with_work)
+    # later scan (higher monotonic order) but wall clock moved back to 1000
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=1000.0, order=11.0))
+    assert len(github_maintenance.load_surfaced_store(path)["prs"]) == 1
+
+
+def test_snapshot_from_the_future_is_not_adopted(tmp_path):
+    import time
+    path = str(tmp_path / "cache.json")
+    github_maintenance.save_surfaced_store(path, {
+        "prs": [], "failing_flows": [], "counts": {}, "errors": [],
+        "last_poll": time.time() + 3600, "error": None})
+    assert github_maintenance.MaintenanceWatchdog(cache_path=path).get_cached()["last_poll"] == 0
+
+
+def test_persist_does_not_block_the_event_loop(tmp_path, monkeypatch):
+    import time
+    path = str(tmp_path / "cache.json")
+
+    async def scan(**kw):
+        return {"prs": [], "failing_flows": [], "counts": {}, "errors": []}
+    monkeypatch.setattr(github_maintenance, "scan_maintenance", scan)
+
+    async def main():
+        ticks = []
+
+        async def ticker():
+            for _ in range(10):
+                await asyncio.sleep(0.02)
+                ticks.append(time.monotonic())
+        with github_maintenance.locked_store(path) as _:
+            pass
+        import threading
+        release = threading.Event()
+        real = github_maintenance.locked_store
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def slow_lock(p):
+            with real(p):
+                release.wait(0.4)
+                yield
+        monkeypatch.setattr(github_maintenance, "locked_store", slow_lock)
+        t = asyncio.create_task(ticker())
+        await github_maintenance.MaintenanceWatchdog(cache_path=path).poll()
+        await t
+        gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+        assert max(gaps) < 0.2, gaps  # loop kept ticking while the lock was held
+    asyncio.run(main())
