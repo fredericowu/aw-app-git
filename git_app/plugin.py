@@ -566,7 +566,12 @@ class GitAppPlugin:
             gone = {aw_run_nudge.pr_key(d) for d in outcome.get("dropped") or []
                     if "no longer open" in d["reason"] or "label removed" in d["reason"]}
             live_keys = tagged_keys - gone
-            mgr, applied = aw_run_nudge.manager_prs(store, live_keys, now_ts)
+            # A nudge outage must not let a previous verdict keep hiding PRs that
+            # may need the Manager now: fail open to the ordinary attention filter.
+            if outcome.get("error"):
+                mgr, applied = [], set()
+            else:
+                mgr, applied = aw_run_nudge.manager_prs(store, live_keys, now_ts)
             fallback = [e for e in (cached.get("aw_run_attention") or [])
                         if aw_run_nudge.pr_key(e) not in applied
                         and aw_run_nudge.pr_key(e) in live_keys]

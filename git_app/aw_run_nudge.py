@@ -35,8 +35,12 @@ log = logging.getLogger("aw_apps.git.aw_run_nudge")
 RUNNERS_APP_ID = "agents-platform-runners"
 API_KEY_VAR = "AW_WORKSPACE_API_KEY"
 CONTAINER_DIR = os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace")
-# Inside the dag http node's timeout (30s): live re-check + this call must fit.
-TIMEOUT_S = 20.0
+# Inside the dag http node's timeout (30s): live re-check (LIVE_RECHECK_BUDGET_S)
+# + this call must fit. The runners proxy gives AP-MT 15s, so this stays above
+# it: the proxy always expires first and we never report a transport failure
+# for a nudge that actually completed.
+TIMEOUT_S = 17.0
+LIVE_RECHECK_BUDGET_S = 9.0
 
 STORE_REL = "data/git/github_maintenance_aw_run.json"
 #: A persisted verdict older than this is not applied by a plain GET (the
@@ -125,7 +129,7 @@ async def live_recheck(tagged: list, gh_runner, *, concurrency: int = gm.GH_MAX_
         if (view.get("state") or "").upper() != "OPEN":
             dropped.append({**_ident(pr), "reason": f"no longer open ({view.get('state')})"})
             return
-        labels = gm.label_names(view.get("labels")) or pr.get("labels") or []
+        labels = gm.label_names(view.get("labels"))  # live labels only; never the cached ones
         run_id = gm.extract_aw_run_id(labels)
         if not run_id:
             dropped.append({**_ident(pr), "reason": "aw-run label removed"})
@@ -233,7 +237,12 @@ async def run_nudge(*, tagged: list, gh_runner, store_path: str, now: "float | N
     store}``; ``error`` is set (and ``store`` untouched) when the transport
     failed, which the caller treats as fail-open."""
     now = now if now is not None else time.time()
-    still_open, dropped = await live_recheck(tagged, gh_runner)
+    try:
+        still_open, dropped = await asyncio.wait_for(
+            live_recheck(tagged, gh_runner), timeout=LIVE_RECHECK_BUDGET_S)
+    except asyncio.TimeoutError:
+        return {"error": f"live re-check exceeded {LIVE_RECHECK_BUDGET_S:.0f}s", "dropped": [],
+                "nudged": 0}
     if dropped and not dry_run:
         # A merged/closed/untagged PR must not keep applying a stale verdict.
         with gm.locked_store(store_path):

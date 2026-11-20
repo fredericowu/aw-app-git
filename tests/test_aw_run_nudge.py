@@ -215,3 +215,42 @@ def test_call_nudge_without_api_key_raises(monkeypatch, tmp_path):
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
     with pytest.raises(aw_run_nudge.NudgeError):
         aw_run_nudge.call_nudge({"prs": []})
+
+
+def test_label_removed_live_never_wakes_with_cached_label(env):
+    tc, app, state, _ = env
+    state["view"] = {"state": "OPEN", "headRefOid": "x", "labels": []}
+    _warm(app, tagged=[_tagged()], attention=[_att()])
+    r = tc.get("/github/maintenance?nudge=true").json()
+    assert not state["calls"]
+    assert "label removed" in r["aw_run"]["dropped"][0]["reason"]
+
+
+def test_previous_woken_verdict_does_not_hide_pr_during_nudge_outage(env):
+    tc, app, state, _ = env
+    state["verdict"] = "woken"
+    _warm(app, tagged=[_tagged()], attention=[_att()])
+    assert tc.get("/github/maintenance?nudge=true").json()["prs"] == []
+    state["fail"] = "AP-MT down"
+    r = tc.get("/github/maintenance?nudge=true").json()
+    assert [p["number"] for p in r["prs"]] == [7] and r["has_work"] is True
+    assert "AP-MT down" in r["aw_run"]["error"]
+
+
+def test_slow_live_recheck_fails_open_within_budget(env, monkeypatch):
+    tc, app, state, _ = env
+    monkeypatch.setattr(aw_run_nudge, "LIVE_RECHECK_BUDGET_S", 0.05)
+
+    async def slow(args):
+        await asyncio.sleep(1)
+        return 0, "{}", ""
+    app._maintenance._gh_runner = slow
+    _warm(app, tagged=[_tagged()], attention=[_att()])
+    r = tc.get("/github/maintenance?nudge=true").json()
+    assert "live re-check exceeded" in r["aw_run"]["error"] and not state["calls"]
+    assert [p["number"] for p in r["prs"]] == [7]
+
+
+def test_client_timeout_stays_above_runners_proxy_timeout():
+    assert aw_run_nudge.TIMEOUT_S >= 15 + 2
+    assert aw_run_nudge.LIVE_RECHECK_BUDGET_S + aw_run_nudge.TIMEOUT_S < 30
