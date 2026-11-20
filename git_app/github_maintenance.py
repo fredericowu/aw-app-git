@@ -963,12 +963,14 @@ class MaintenanceWatchdog:
 
     def get_cached(self) -> dict:
         self._adopt_shared_cache()
-        if self._adopted and time.time() - float(self._cache.get("last_poll") or 0) > SHARED_CACHE_MAX_AGE_S:
+        age = time.time() - float(self._cache.get("last_poll") or 0)
+        if self._adopted and (age > SHARED_CACHE_MAX_AGE_S or age < -60):
             # An adopted snapshot keeps its age limit: leader stopped
             # publishing -> go cold so the route re-scans, not serve stale.
             self._cache.update({"prs": [], "aw_run_prs": [], "aw_run_attention": [],
                                 "failing_flows": [], "counts": {}, "errors": [],
-                                "last_poll": 0, "error": None})
+                                "last_poll": 0, "error": None,
+                                "order": None, "boot_id": None})
             self._adopted = False
         return dict(self._cache)
 
@@ -982,7 +984,15 @@ class MaintenanceWatchdog:
             last = float(snap.get("last_poll") or 0)
         except (TypeError, ValueError):
             return
-        if last <= float(self._cache.get("last_poll") or 0):
+        if not last:
+            return
+        own_order, snap_order = self._cache.get("order"), snap.get("order")
+        if (own_order is not None and snap_order is not None
+                and snap.get("boot_id") == self._cache.get("boot_id")):
+            # same boot: order by the monotonic scan stamp, not wall clock
+            if float(snap_order) <= float(own_order):
+                return
+        elif last <= float(self._cache.get("last_poll") or 0):
             return
         age = time.time() - last
         # negative age = clock moved backward since publish: don't trust it
@@ -993,6 +1003,8 @@ class MaintenanceWatchdog:
                 self._cache[key] = snap[key]
         self._cache["error"] = None
         self._cache["last_poll"] = last
+        self._cache["order"] = snap.get("order")
+        self._cache["boot_id"] = snap.get("boot_id")
         self._adopted = True
 
     def _persist_shared_cache(self, snapshot: dict) -> None:
@@ -1056,6 +1068,8 @@ class MaintenanceWatchdog:
             log.warning("github maintenance scan failed: %s", e)
             self._cache["error"] = str(e)
         self._cache["last_poll"] = now
+        self._cache["order"] = order
+        self._cache["boot_id"] = _boot_id()
         self._adopted = False
         if self._cache["error"] is None:
             snapshot = dict(self._cache, order=order, boot_id=_boot_id())

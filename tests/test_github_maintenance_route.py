@@ -650,3 +650,23 @@ def test_persist_does_not_block_the_event_loop(tmp_path, monkeypatch):
         gaps = [b - a for a, b in zip(ticks, ticks[1:])]
         assert max(gaps) < 0.2, gaps  # loop kept ticking while the lock was held
     asyncio.run(main())
+
+
+def test_warm_worker_adopts_a_newer_scan_published_after_a_backward_clock_step(tmp_path, monkeypatch):
+    import time
+    path = str(tmp_path / "cache.json")
+    base = time.time()
+
+    async def scan_empty(**kw):
+        return {"prs": [], "failing_flows": [], "counts": {}, "errors": []}
+
+    async def scan_with_work(**kw):
+        return {"prs": [_pr()], "failing_flows": [], "counts": {}, "errors": []}
+    monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_empty)
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=base, order=10.0))
+    warm = github_maintenance.MaintenanceWatchdog(cache_path=path)
+    assert warm.get_cached()["prs"] == []  # adopted the empty snapshot
+    monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_with_work)
+    # later scan, wall clock stepped back 30s (within the future tolerance)
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=base - 30, order=11.0))
+    assert len(warm.get_cached()["prs"]) == 1
