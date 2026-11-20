@@ -938,6 +938,7 @@ class MaintenanceWatchdog:
                  scope_fn: "Callable[[], dict] | None" = None,
                  cache_path: "str | None" = None):
         self._cache_path = cache_path
+        self._adopted = False
         self._base_dir = base_dir
         self._store_path = store_path
         self._gh_runner = gh_runner
@@ -954,6 +955,13 @@ class MaintenanceWatchdog:
 
     def get_cached(self) -> dict:
         self._adopt_shared_cache()
+        if self._adopted and time.time() - float(self._cache.get("last_poll") or 0) > SHARED_CACHE_MAX_AGE_S:
+            # An adopted snapshot keeps its age limit: leader stopped
+            # publishing -> go cold so the route re-scans, not serve stale.
+            self._cache.update({"prs": [], "aw_run_prs": [], "aw_run_attention": [],
+                                "failing_flows": [], "counts": {}, "errors": [],
+                                "last_poll": 0, "error": None})
+            self._adopted = False
         return dict(self._cache)
 
     def _adopt_shared_cache(self) -> None:
@@ -970,11 +978,12 @@ class MaintenanceWatchdog:
             return
         if time.time() - last > SHARED_CACHE_MAX_AGE_S or snap.get("error") is not None:
             return
-        for key in ("prs", "failing_flows", "counts", "errors"):
+        for key in ("prs", "aw_run_prs", "aw_run_attention", "failing_flows", "counts", "errors"):
             if key in snap:
                 self._cache[key] = snap[key]
         self._cache["error"] = None
         self._cache["last_poll"] = last
+        self._adopted = True
 
     def _persist_shared_cache(self) -> None:
         if not self._cache_path:
@@ -1023,6 +1032,7 @@ class MaintenanceWatchdog:
             log.warning("github maintenance scan failed: %s", e)
             self._cache["error"] = str(e)
         self._cache["last_poll"] = now
+        self._adopted = False
         if self._cache["error"] is None:
             self._persist_shared_cache()
 

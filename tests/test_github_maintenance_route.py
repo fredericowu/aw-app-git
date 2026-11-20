@@ -543,3 +543,30 @@ def test_failed_poll_does_not_overwrite_the_snapshot(tmp_path, monkeypatch):
     github_maintenance.save_surfaced_store(path, {"last_poll": 5.0, "prs": [], "failing_flows": []})
     asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll())
     assert github_maintenance.load_surfaced_store(path)["last_poll"] == 5.0
+
+
+def test_adopted_snapshot_restores_aw_run_prs_for_the_nudge(tmp_path):
+    import time
+    path = str(tmp_path / "cache.json")
+    tagged = {"repo": "o/r", "number": 7, "url": "https://github.com/o/r/pull/7"}
+    github_maintenance.save_surfaced_store(path, {
+        "prs": [], "aw_run_prs": [tagged], "aw_run_attention": [tagged],
+        "failing_flows": [], "counts": {}, "errors": [],
+        "last_poll": time.time() - 5, "error": None})
+    cached = github_maintenance.MaintenanceWatchdog(cache_path=path).get_cached()
+    assert cached["aw_run_prs"] == [tagged] and cached["aw_run_attention"] == [tagged]
+
+
+def test_adopted_snapshot_expires_on_the_same_worker(tmp_path, monkeypatch):
+    import time
+    path = str(tmp_path / "cache.json")
+    now = time.time()
+    github_maintenance.save_surfaced_store(path, {
+        "prs": [], "failing_flows": [_flow()], "counts": {}, "errors": [],
+        "last_poll": now - 10, "error": None})
+    wd = github_maintenance.MaintenanceWatchdog(cache_path=path)
+    assert wd.get_cached()["last_poll"] > 0
+    monkeypatch.setattr(github_maintenance.time, "time",
+                        lambda: now + github_maintenance.SHARED_CACHE_MAX_AGE_S + 60)
+    cached = wd.get_cached()
+    assert cached["last_poll"] == 0 and cached["failing_flows"] == []
