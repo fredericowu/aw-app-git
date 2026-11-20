@@ -87,6 +87,12 @@ SEARCH_LIMIT = 1000
 RUNS_PER_PAGE = 10
 
 STORE_REL = "data/git/github_maintenance_surfaced.json"
+# Cross-worker snapshot of the last completed scan (card 41e5bf3b): only the
+# watchdog-leader worker ever ticks, so a cold sibling worker adopts this file
+# instead of answering warming_up (which the dag gate read as "no work").
+CACHE_REL = "data/git/github_maintenance_cache.json"
+# A snapshot older than this is not trusted (leader dead / scan broken).
+SHARED_CACHE_MAX_AGE_S = 3 * 3600.0
 
 _SSH_RE = re.compile(r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$")
 _SSH_URL_RE = re.compile(r"^ssh://git@github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$")
@@ -359,6 +365,11 @@ async def view_pr(url: str, gh_runner: GhRunner) -> "tuple[dict | None, str | No
 def default_store_path() -> str:
     home = os.environ.get("AW_WORKSPACE_HOME") or os.path.expanduser("~/.aw-workspace")
     return os.path.join(home, STORE_REL)
+
+
+def default_cache_path() -> str:
+    home = os.environ.get("AW_WORKSPACE_HOME") or os.path.expanduser("~/.aw-workspace")
+    return os.path.join(home, CACHE_REL)
 
 
 def load_surfaced_store(path: str) -> dict:
@@ -924,7 +935,9 @@ class MaintenanceWatchdog:
                  gh_runner: GhRunner = default_gh_runner,
                  git_remote_url: "Callable[[str], str | None]" = _git_remote_url,
                  stall_hours: float = DEFAULT_STALL_HOURS, concurrency: int = GH_MAX_CONCURRENCY,
-                 scope_fn: "Callable[[], dict] | None" = None):
+                 scope_fn: "Callable[[], dict] | None" = None,
+                 cache_path: "str | None" = None):
+        self._cache_path = cache_path
         self._base_dir = base_dir
         self._store_path = store_path
         self._gh_runner = gh_runner
@@ -940,7 +953,36 @@ class MaintenanceWatchdog:
         self._inflight: "asyncio.Task | None" = None
 
     def get_cached(self) -> dict:
+        self._adopt_shared_cache()
         return dict(self._cache)
+
+    def _adopt_shared_cache(self) -> None:
+        """Adopt the cross-worker snapshot when it is newer than this
+        worker's own (or this worker is cold) and not stale."""
+        if not self._cache_path:
+            return
+        snap = load_surfaced_store(self._cache_path)  # fails open to {}
+        try:
+            last = float(snap.get("last_poll") or 0)
+        except (TypeError, ValueError):
+            return
+        if last <= float(self._cache.get("last_poll") or 0):
+            return
+        if time.time() - last > SHARED_CACHE_MAX_AGE_S or snap.get("error") is not None:
+            return
+        for key in ("prs", "failing_flows", "counts", "errors"):
+            if key in snap:
+                self._cache[key] = snap[key]
+        self._cache["error"] = None
+        self._cache["last_poll"] = last
+
+    def _persist_shared_cache(self) -> None:
+        if not self._cache_path:
+            return
+        try:
+            save_surfaced_store(self._cache_path, dict(self._cache))
+        except Exception as e:  # never break the poll over the snapshot
+            log.warning("github maintenance shared cache write failed: %s", e)
 
     def poll_task(self) -> "asyncio.Task":
         """Single-flight entry point for a cold-cache caller (card
@@ -981,6 +1023,8 @@ class MaintenanceWatchdog:
             log.warning("github maintenance scan failed: %s", e)
             self._cache["error"] = str(e)
         self._cache["last_poll"] = now
+        if self._cache["error"] is None:
+            self._persist_shared_cache()
 
 
 __all__ = [
@@ -991,6 +1035,6 @@ __all__ = [
     "analyze_workflow_runs", "scan_repo_failing_workflows", "scan_maintenance",
     "MaintenanceWatchdog", "DEFAULT_STALL_HOURS", "SURFACE_BACKOFF_CEILING_HOURS",
     "DEFAULT_POLL_INTERVAL_S", "ATTENTION_BADGES",
-    "default_ping_state_path", "flow_key", "plan_maintenance_pings",
+    "default_cache_path", "default_ping_state_path", "flow_key", "plan_maintenance_pings",
     "DEFAULT_PING_SUMMARY_INTERVAL_HOURS", "locked_store",
 ]
