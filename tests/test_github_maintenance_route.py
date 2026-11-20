@@ -623,7 +623,7 @@ def test_persist_does_not_block_the_event_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(github_maintenance, "scan_maintenance", scan)
 
     async def main():
-        ticks = []
+        ticks = [time.monotonic()]  # baseline before the poll starts
 
         async def ticker():
             for _ in range(10):
@@ -644,6 +644,7 @@ def test_persist_does_not_block_the_event_loop(tmp_path, monkeypatch):
                 yield
         monkeypatch.setattr(github_maintenance, "locked_store", slow_lock)
         t = asyncio.create_task(ticker())
+        await asyncio.sleep(0)  # let the ticker start its first sleep
         await github_maintenance.MaintenanceWatchdog(cache_path=path).poll()
         await t
         gaps = [b - a for a, b in zip(ticks, ticks[1:])]
