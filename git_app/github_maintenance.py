@@ -75,7 +75,7 @@ DEFAULT_POLL_INTERVAL_S = 1800.0  # ~30min
 
 ATTENTION_BADGES = {"tests-failed", "ready-to-merge", "needs-review"}
 
-SEARCH_FIELDS = "number,repository,title,url,updatedAt,isDraft,createdAt,author"
+SEARCH_FIELDS = "number,repository,title,url,updatedAt,isDraft,createdAt,author,labels"
 VIEW_FIELDS = "statusCheckRollup,reviewDecision,mergeable,isDraft,updatedAt"
 
 # Same reasoning as pr_scan.py's own SEARCH_LIMIT (code-review finding, PR
@@ -521,6 +521,33 @@ def surfaced_backoff_state(current_updated_at: "str | None", stamp: "dict | None
     return "backed_off"
 
 
+AW_RUN_LABEL_PREFIX = "aw-run:"
+_AW_RUN_ID_RE = re.compile(
+    r"^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})$")
+
+
+def label_names(labels: Any) -> list:
+    """Label names from a ``gh`` ``labels`` field (dicts with ``name``) or a
+    plain list of strings."""
+    out = []
+    for lab in labels or []:
+        name = lab.get("name") if isinstance(lab, dict) else lab
+        if isinstance(name, str):
+            out.append(name)
+    return out
+
+
+def extract_aw_run_id(labels: Any) -> "str | None":
+    """The run id of an ``aw-run:<id>`` label (32-hex or dashed uuid, same
+    forms as AP-MT's ``_AW_RUN_ID_TRAILER_RE``), else ``None``."""
+    for name in label_names(labels):
+        if name.startswith(AW_RUN_LABEL_PREFIX):
+            candidate = name[len(AW_RUN_LABEL_PREFIX):].strip().lower()
+            if _AW_RUN_ID_RE.match(candidate):
+                return candidate.replace("-", "")
+    return None
+
+
 def _pr_key(full_name: str, number: Any) -> str:
     return f"{full_name}#{number}"
 
@@ -556,11 +583,29 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
 
     open_pr_keys: set = set()
     probe_batch: list = []
+    # PRs tagged ``aw-run:<run id>`` are split out BEFORE the draft check and
+    # the surfaced back-off: an open draft whose agent went idle is exactly the
+    # case the chain-idle nudge exists for, and the nudge has its own ledger.
+    aw_run_prs: list = []
+    aw_run_probe: list = []
 
     for pr in all_prs:
         full_name = (pr.get("repository") or {}).get("nameWithOwner") or ""
         key = _pr_key(full_name, pr.get("number"))
         open_pr_keys.add(key)
+        run_id = extract_aw_run_id(pr.get("labels"))
+        if run_id:
+            aw_run_prs.append({
+                "repo": full_name, "number": pr.get("number"), "url": pr.get("url"),
+                "title": pr.get("title"), "run_id": run_id,
+                "labels": label_names(pr.get("labels")), "is_draft": bool(pr.get("isDraft")),
+                "updated_at": pr.get("updatedAt"),
+            })
+            if not pr.get("isDraft"):
+                # Fail-open path: if the nudge cannot run, these go through the
+                # ordinary attention filter. Unstamped, no back-off.
+                aw_run_probe.append((key, full_name, pr))
+            continue
         if pr.get("isDraft"):
             continue
         if surfaced_backoff_state(pr.get("updatedAt"), store.get(key), now) == "backed_off":
@@ -568,8 +613,9 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
         probe_batch.append((key, full_name, pr))
 
     attention: list = []
+    aw_run_attention: list = []
 
-    async def _probe(item) -> None:
+    async def _probe(item, *, tagged: bool = False) -> None:
         key, full_name, pr = item
         view, error = await view_pr(pr.get("url"), gh_runner)
         if error is not None:
@@ -594,24 +640,35 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
         if not reasons:
             return
 
-        attention.append({
+        entry = {
             "repo": full_name, "number": pr.get("number"), "url": pr.get("url"),
             "title": pr.get("title"), "author": (pr.get("author") or {}).get("login"),
             "badge": badge, "updated_at": updated_at, "age_hours": age_hours,
             "attention_reason": "; ".join(reasons),
-        })
+        }
+        if tagged:
+            aw_run_attention.append(entry)
+            return
+        attention.append(entry)
         store[key] = {"surfaced_at": now, "updated_at": updated_at}
 
+    async def _probe_tagged(item) -> None:
+        await _probe(item, tagged=True)
+
     await _bounded_gather(probe_batch, _probe, concurrency=concurrency)
+    await _bounded_gather(aw_run_probe, _probe_tagged, concurrency=concurrency)
 
     return {
         "attention": attention,
+        "aw_run_prs": aw_run_prs,
+        "aw_run_attention": aw_run_attention,
         "errors": errors,
         "searched_owners": searched_owners,
         "open_pr_keys": open_pr_keys,
         "counts": {
             "owners": len(owners), "candidates_considered": len(all_prs),
             "probed": len(probe_batch), "attention": len(attention),
+            "aw_run_tagged": len(aw_run_prs),
             "truncated_owners": sorted(truncated_owners),
         },
     }
@@ -836,6 +893,8 @@ async def scan_maintenance(*, now: float, gh_runner: GhRunner = default_gh_runne
 
     return {
         "prs": pr_result["attention"],
+        "aw_run_prs": pr_result["aw_run_prs"],
+        "aw_run_attention": pr_result["aw_run_attention"],
         "failing_flows": failing_flows,
         "counts": {
             **pr_result["counts"],
@@ -874,7 +933,8 @@ class MaintenanceWatchdog:
         self._concurrency = concurrency
         self._scope_fn = scope_fn
         self._cache: dict = {
-            "prs": [], "failing_flows": [], "counts": {}, "errors": [],
+            "prs": [], "aw_run_prs": [], "aw_run_attention": [],
+            "failing_flows": [], "counts": {}, "errors": [],
             "last_poll": 0, "error": None,
         }
         self._inflight: "asyncio.Task | None" = None
@@ -910,6 +970,8 @@ class MaintenanceWatchdog:
                 stall_hours=self._stall_hours, concurrency=self._concurrency,
                 store_path=self._store_path, scope=scope)
             self._cache["prs"] = result["prs"]
+            self._cache["aw_run_prs"] = result.get("aw_run_prs", [])
+            self._cache["aw_run_attention"] = result.get("aw_run_attention", [])
             self._cache["failing_flows"] = result["failing_flows"]
             self._cache["counts"] = result["counts"]
             self._cache["errors"] = result["errors"]

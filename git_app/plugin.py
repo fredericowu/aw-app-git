@@ -38,7 +38,7 @@ _now_s = time.time
 # param gets mistaken for a required query field (close 1008 on connect).
 from fastapi import WebSocket, WebSocketDisconnect
 
-from . import device_flow, gh_auth, github_maintenance, github_prs, uncommitted_watchdog
+from . import aw_run_nudge, device_flow, gh_auth, github_maintenance, github_prs, uncommitted_watchdog
 
 log = logging.getLogger("aw_apps.git")
 
@@ -544,8 +544,59 @@ class GitAppPlugin:
                 "daily_summary_sent": bool(plan["summary_due"]) and not summary_failed,
             }
 
+        async def _apply_aw_run(tagged: list, cached: dict, nudge: bool, dry_run: bool):
+            """``(PRs to add to the Manager's list, aw_run block)``."""
+            now_ts = time.time()
+            store_path = aw_run_nudge.default_store_path()
+            tagged_keys = {aw_run_nudge.pr_key(p) for p in tagged}
+            outcome = {"error": None, "dropped": []}
+            if nudge and tagged:
+                outcome = await aw_run_nudge.run_nudge(
+                    tagged=tagged, gh_runner=maintenance._gh_runner, store_path=store_path,
+                    now=now_ts, dry_run=dry_run)
+            if not dry_run:
+                with github_maintenance.locked_store(store_path):
+                    store = aw_run_nudge.load_store(store_path)
+                    pruned = aw_run_nudge.prune_store(store, tagged_keys)
+                    if pruned != store:
+                        aw_run_nudge.save_store(store_path, pruned)
+                    store = pruned
+            else:
+                store = aw_run_nudge.load_store(store_path)
+            gone = {aw_run_nudge.pr_key(d) for d in outcome.get("dropped") or []
+                    if "no longer open" in d["reason"] or "label removed" in d["reason"]}
+            live_keys = tagged_keys - gone
+            # A nudge outage must not let a previous verdict keep hiding PRs that
+            # may need the Manager now: fail open to the ordinary attention filter.
+            # The marker persists the outage for the Manager's plain re-read.
+            marker = aw_run_nudge.recent_outage(store_path, now_ts)
+            outage = outcome.get("error") or (marker or {}).get("reason")
+            if outcome.get("error") or (marker and marker["keys"] is None):
+                blind = set(live_keys)           # whole-call failure: every PR fails open
+            else:                                # only the PRs whose re-check failed
+                blind = set(outcome.get("unverified") or []) | set((marker or {}).get("keys") or [])
+            if not nudge and marker and marker["keys"] is not None and not outcome.get("error"):
+                outage = marker["reason"]
+            elif outcome.get("unverified") and not outcome.get("error"):
+                outage = f"live re-check failed for {len(blind)} PR(s)"
+            mgr, applied = aw_run_nudge.manager_prs(store, live_keys - blind, now_ts)
+            fallback = [{**e, "aw_run": {"fallback": True}}
+                        for e in (cached.get("aw_run_attention") or [])
+                        if aw_run_nudge.pr_key(e) not in applied
+                        and aw_run_nudge.pr_key(e) in live_keys]
+            if not dry_run:
+                await aw_run_nudge.attach_live_labels(mgr + fallback, maintenance._gh_runner)
+            block = aw_run_nudge.summarize(store, live_keys, applied, now_ts)
+            block.update({"nudge": bool(nudge), "dry_run": bool(dry_run),
+                          "error": outage, "dropped": outcome.get("dropped") or [],
+                          "fallback_attention": len(fallback)})
+            if dry_run and outcome.get("verdicts") is not None:
+                block["dry_run_verdicts"] = outcome["verdicts"]
+            return mgr + fallback, block
+
         @api.get("/github/maintenance")
-        async def get_maintenance(limit: int = Query(20, ge=0), ping: bool = False):
+        async def get_maintenance(limit: int = Query(20, ge=0), ping: bool = False,
+                                  nudge: bool = False, nudge_dry_run: bool = False):
             """Sync gate on the GitHub Maintenance scan cache. ``has_work``
             = any attention PR OR any failing flow. Non-2xx when the scan
             layer itself is broken (a top-level ``scan_maintenance``
@@ -579,6 +630,18 @@ class GitAppPlugin:
             ``ping=true`` (the Workflow's gate node) fires the instant/daily
             notifications, synchronously, inside this handler — never on a
             ``warming_up`` response, same as the existing broken-scan path.
+
+            ``nudge=true`` (Kanban 41e5bf3b) additionally runs the aw-run PR
+            chain-idle nudge for PRs labelled ``aw-run:<run id>`` BEFORE
+            ``has_work`` is computed: tagged PRs are live re-checked (still
+            OPEN), sent to AP-MT through the runners app, and only those whose
+            verdict hands over to the Manager (``attention_reason`` starts
+            ``aw-run:``) appear in ``prs``. The verdicts are persisted, so a
+            plain GET (the Manager's re-read) applies the last verdict and
+            does not show the tagged PRs again. Nudge transport failure fails
+            OPEN: tagged PRs take the ordinary attention filter and
+            ``aw_run.error`` says why. ``nudge_dry_run=true`` evaluates
+            without waking anyone or persisting.
             """
             cached = maintenance.get_cached()
             if not cached["last_poll"]:
@@ -602,9 +665,20 @@ class GitAppPlugin:
             if cached.get("error"):
                 return JSONResponse({"has_work": False, "error": cached["error"]}, status_code=502)
 
-            prs_list = cached.get("prs") or []
+            prs_list = list(cached.get("prs") or [])
             failing_flows = cached.get("failing_flows") or []
             counts = cached.get("counts") or {}
+
+            aw_run_block = None
+            tagged = list(cached.get("aw_run_prs") or [])
+            if tagged or nudge:
+                try:
+                    aw_prs, aw_run_block = await _apply_aw_run(tagged, cached, nudge, nudge_dry_run)
+                    prs_list.extend(aw_prs)
+                except Exception as exc:  # never let the gate die on the nudge
+                    log.exception("aw-run partition failed; falling back to ordinary attention")
+                    prs_list.extend(cached.get("aw_run_attention") or [])
+                    aw_run_block = {"error": f"{type(exc).__name__}: {exc}"}
 
             result = {
                 "has_work": bool(prs_list) or bool(failing_flows),
@@ -619,6 +693,8 @@ class GitAppPlugin:
                     "watched_repos": counts.get("watched_repos", 0),
                 },
             }
+            if aw_run_block is not None:
+                result["aw_run"] = aw_run_block
             if ping:
                 pings = _ping_maintenance(failing_flows)
                 if pings is not None:
