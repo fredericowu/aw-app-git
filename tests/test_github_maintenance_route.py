@@ -721,7 +721,7 @@ def test_malformed_snapshot_order_is_skipped_not_a_500(setup, tmp_path, bad):
     assert app._maintenance.get_cached()["last_poll"] == 0
 
 
-@pytest.mark.parametrize("bad", [float("inf"), float("nan"), "500", True, [1]])
+@pytest.mark.parametrize("bad", [float("inf"), float("nan"), "500", True, [1], 10**400])
 def test_publish_overwrites_a_non_finite_on_disk_order(tmp_path, monkeypatch, bad):
     path = str(tmp_path / "cache.json")
     github_maintenance.save_surfaced_store(path, {
