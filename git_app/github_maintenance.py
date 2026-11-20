@@ -1001,6 +1001,8 @@ class MaintenanceWatchdog:
             # same boot: order by the monotonic scan stamp, not wall clock
             if float(snap_order) <= float(own_order):
                 return
+        elif snap_order is not None and own_order is None:
+            pass  # new-format snapshot supersedes a legacy/unordered cache
         elif last <= float(self._cache.get("last_poll") or 0):
             return
         age = _snapshot_age(snap)

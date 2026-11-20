@@ -663,12 +663,13 @@ def test_warm_worker_adopts_a_newer_scan_published_after_a_backward_clock_step(t
     async def scan_with_work(**kw):
         return {"prs": [_pr()], "failing_flows": [], "counts": {}, "errors": []}
     monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_empty)
-    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=base, order=10.0))
+    mono = time.monotonic()
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=base, order=mono - 20))
     warm = github_maintenance.MaintenanceWatchdog(cache_path=path)
-    assert warm.get_cached()["prs"] == []  # adopted the empty snapshot
+    assert warm.get_cached()["prs"] == [] and warm._adopted  # adopted the empty snapshot
     monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_with_work)
     # later scan, wall clock stepped back 30s (within the future tolerance)
-    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=base - 30, order=11.0))
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=base - 30, order=mono - 5))
     assert len(warm.get_cached()["prs"]) == 1
 
 
@@ -690,4 +691,19 @@ def test_wall_clock_rollback_during_a_scan_does_not_hide_the_newer_snapshot(tmp_
     monkeypatch.setattr(github_maintenance, "scan_maintenance", scan_with_work)
     # newer scan; wall clock stepped back ~15 minutes (age -900s by wall clock)
     asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(now=base - 900, order=mono - 5))
+    assert len(warm.get_cached()["prs"]) == 1
+
+
+def test_new_format_snapshot_supersedes_a_legacy_adopted_one(tmp_path):
+    import time
+    path = str(tmp_path / "cache.json")
+    base = time.time()
+    github_maintenance.save_surfaced_store(path, {  # legacy: no order/boot_id
+        "prs": [], "failing_flows": [], "counts": {}, "errors": [], "last_poll": base, "error": None})
+    warm = github_maintenance.MaintenanceWatchdog(cache_path=path)
+    assert warm.get_cached()["last_poll"] == base and warm._adopted
+    github_maintenance.save_surfaced_store(path, {
+        "prs": [_pr()], "failing_flows": [], "counts": {}, "errors": [],
+        "last_poll": base - 30, "order": time.monotonic(),
+        "boot_id": github_maintenance._boot_id(), "error": None})
     assert len(warm.get_cached()["prs"]) == 1
