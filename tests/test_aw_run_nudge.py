@@ -235,6 +235,24 @@ def test_previous_woken_verdict_does_not_hide_pr_during_nudge_outage(env):
     r = tc.get("/github/maintenance?nudge=true").json()
     assert [p["number"] for p in r["prs"]] == [7] and r["has_work"] is True
     assert "AP-MT down" in r["aw_run"]["error"]
+    # the Manager's plain re-read must see the same fail-open decision
+    r2 = tc.get("/github/maintenance?limit=20").json()
+    assert [p["number"] for p in r2["prs"]] == [7] and r2["has_work"] is True
+    assert "AP-MT down" in r2["aw_run"]["error"]
+    # a later successful nudge clears the outage and replays verdicts again
+    state["fail"] = None
+    assert tc.get("/github/maintenance?nudge=true").json()["prs"] == []
+    assert tc.get("/github/maintenance").json()["prs"] == []
+
+
+def test_call_exceeding_wall_clock_deadline_fails_open(env, monkeypatch):
+    tc, app, state, _ = env
+    monkeypatch.setattr(aw_run_nudge, "TIMEOUT_S", 1.0)
+    monkeypatch.setattr(aw_run_nudge, "call_nudge", lambda body: __import__("time").sleep(2))
+    _warm(app, tagged=[_tagged()], attention=[_att()])
+    r = tc.get("/github/maintenance?nudge=true").json()
+    assert "wall-clock" in r["aw_run"]["error"]
+    assert [p["number"] for p in r["prs"]] == [7]
 
 
 def test_slow_live_recheck_fails_open_within_budget(env, monkeypatch):
@@ -254,3 +272,4 @@ def test_slow_live_recheck_fails_open_within_budget(env, monkeypatch):
 def test_client_timeout_stays_above_runners_proxy_timeout():
     assert aw_run_nudge.TIMEOUT_S >= 15 + 2
     assert aw_run_nudge.LIVE_RECHECK_BUDGET_S + aw_run_nudge.TIMEOUT_S < 30
+    assert aw_run_nudge.TOTAL_DEADLINE_S < 30

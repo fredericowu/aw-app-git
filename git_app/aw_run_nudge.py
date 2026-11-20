@@ -41,6 +41,11 @@ CONTAINER_DIR = os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace"
 # for a nudge that actually completed.
 TIMEOUT_S = 17.0
 LIVE_RECHECK_BUDGET_S = 9.0
+#: Wall-clock cap for the whole nudge (re-check + call). httpx applies its
+#: timeout per phase (connect/write/read), so the client timeout alone does not
+#: bound the total; ``run_nudge`` enforces this with ``asyncio.wait_for`` and
+#: gives the call only what is left of it. Stays under the workflow's 30s.
+TOTAL_DEADLINE_S = 25.0
 
 STORE_REL = "data/git/github_maintenance_aw_run.json"
 #: A persisted verdict older than this is not applied by a plain GET (the
@@ -187,6 +192,42 @@ def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> 
     return new_store
 
 
+def _outage_path(store_path: str) -> str:
+    return store_path + ".outage"
+
+
+def mark_outage(store_path: str, now: float, reason: str) -> None:
+    """Persist that the last ``nudge=true`` failed, so the Manager's plain
+    re-read does not replay a pre-outage verdict that hides a PR."""
+    try:
+        with open(_outage_path(store_path), "w") as fh:
+            json.dump({"at": now, "reason": reason}, fh)
+    except OSError:
+        log.warning("could not persist aw-run outage marker", exc_info=True)
+
+
+def clear_outage(store_path: str) -> None:
+    try:
+        os.remove(_outage_path(store_path))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        log.warning("could not clear aw-run outage marker", exc_info=True)
+
+
+def recent_outage(store_path: str, now: float) -> "str | None":
+    """Reason of the last failed nudge if no successful one has cleared it
+    (and it is younger than :data:`VERDICT_TTL_S`), else ``None``."""
+    try:
+        with open(_outage_path(store_path)) as fh:
+            data = json.load(fh)
+        if now - float(data.get("at") or 0) > VERDICT_TTL_S:
+            return None
+        return str(data.get("reason") or "nudge failed")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def prune_store(store: dict, open_keys: "set[str]") -> dict:
     return {k: v for k, v in store.items() if k in open_keys}
 
@@ -237,6 +278,17 @@ async def run_nudge(*, tagged: list, gh_runner, store_path: str, now: "float | N
     store}``; ``error`` is set (and ``store`` untouched) when the transport
     failed, which the caller treats as fail-open."""
     now = now if now is not None else time.time()
+    started = time.monotonic()
+    result = await _run_nudge(tagged, gh_runner, store_path, now, dry_run, client, started)
+    if not dry_run:
+        if result.get("error"):
+            mark_outage(store_path, now, result["error"])
+        else:
+            clear_outage(store_path)
+    return result
+
+
+async def _run_nudge(tagged, gh_runner, store_path, now, dry_run, client, started) -> dict:
     try:
         still_open, dropped = await asyncio.wait_for(
             live_recheck(tagged, gh_runner), timeout=LIVE_RECHECK_BUDGET_S)
@@ -258,8 +310,15 @@ async def run_nudge(*, tagged: list, gh_runner, store_path: str, now: "float | N
                      "head_sha": p.get("head_sha") or "", "labels": p.get("labels") or []}
                     for p in still_open],
             "dry_run": dry_run}
+    remaining = min(TIMEOUT_S, TOTAL_DEADLINE_S - (time.monotonic() - started))
+    if remaining <= 0.5:
+        return {"error": "no time left for the nudge call", "dropped": dropped, "nudged": 0}
     try:
-        data = await asyncio.to_thread(client or call_nudge, body)
+        data = await asyncio.wait_for(
+            asyncio.to_thread(client or call_nudge, body), timeout=remaining)
+    except asyncio.TimeoutError:
+        return {"error": f"nudge call exceeded its {remaining:.0f}s wall-clock budget",
+                "dropped": dropped, "nudged": 0}
     except NudgeError as exc:
         log.warning("aw-run nudge failed open: %s", exc)
         return {"error": str(exc), "dropped": dropped, "nudged": 0}

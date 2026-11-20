@@ -568,7 +568,9 @@ class GitAppPlugin:
             live_keys = tagged_keys - gone
             # A nudge outage must not let a previous verdict keep hiding PRs that
             # may need the Manager now: fail open to the ordinary attention filter.
-            if outcome.get("error"):
+            # The marker persists the outage for the Manager's plain re-read.
+            outage = outcome.get("error") or aw_run_nudge.recent_outage(store_path, now_ts)
+            if outage:
                 mgr, applied = [], set()
             else:
                 mgr, applied = aw_run_nudge.manager_prs(store, live_keys, now_ts)
@@ -577,7 +579,7 @@ class GitAppPlugin:
                         and aw_run_nudge.pr_key(e) in live_keys]
             block = aw_run_nudge.summarize(store, live_keys, applied, now_ts)
             block.update({"nudge": bool(nudge), "dry_run": bool(dry_run),
-                          "error": outcome.get("error"), "dropped": outcome.get("dropped") or [],
+                          "error": outage, "dropped": outcome.get("dropped") or [],
                           "fallback_attention": len(fallback)})
             if dry_run and outcome.get("verdicts") is not None:
                 block["dry_run_verdicts"] = outcome["verdicts"]
