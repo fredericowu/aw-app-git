@@ -54,6 +54,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import json
+import math
 import logging
 import os
 import re
@@ -365,6 +366,23 @@ async def view_pr(url: str, gh_runner: GhRunner) -> "tuple[dict | None, str | No
 def default_store_path() -> str:
     home = os.environ.get("AW_WORKSPACE_HOME") or os.path.expanduser("~/.aw-workspace")
     return os.path.join(home, STORE_REL)
+
+
+def _boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _snapshot_age(snap_or_cache: dict) -> float:
+    """Age in seconds. Same boot + monotonic order stamp -> monotonic age
+    (immune to wall-clock steps); otherwise wall-clock age."""
+    order = snap_or_cache.get("order")
+    if order is not None and snap_or_cache.get("boot_id") == _boot_id():
+        return time.monotonic() - float(order)
+    return time.time() - float(snap_or_cache.get("last_poll") or 0)
 
 
 def default_cache_path() -> str:
@@ -955,16 +973,24 @@ class MaintenanceWatchdog:
 
     def get_cached(self) -> dict:
         self._adopt_shared_cache()
-        if self._adopted and time.time() - float(self._cache.get("last_poll") or 0) > SHARED_CACHE_MAX_AGE_S:
+        age = _snapshot_age(self._cache)
+        if self._adopted and (age > SHARED_CACHE_MAX_AGE_S or age < -60):
             # An adopted snapshot keeps its age limit: leader stopped
             # publishing -> go cold so the route re-scans, not serve stale.
             self._cache.update({"prs": [], "aw_run_prs": [], "aw_run_attention": [],
                                 "failing_flows": [], "counts": {}, "errors": [],
-                                "last_poll": 0, "error": None})
+                                "last_poll": 0, "error": None,
+                                "order": None, "boot_id": None})
             self._adopted = False
         return dict(self._cache)
 
     def _adopt_shared_cache(self) -> None:
+        try:
+            self._adopt_shared_cache_unsafe()
+        except (TypeError, ValueError, AttributeError, OverflowError) as e:
+            log.warning("github maintenance: ignoring malformed shared snapshot: %s", e)
+
+    def _adopt_shared_cache_unsafe(self) -> None:
         """Adopt the cross-worker snapshot when it is newer than this
         worker's own (or this worker is cold) and not stale."""
         if not self._cache_path:
@@ -974,22 +1000,54 @@ class MaintenanceWatchdog:
             last = float(snap.get("last_poll") or 0)
         except (TypeError, ValueError):
             return
-        if last <= float(self._cache.get("last_poll") or 0):
+        if not last:
             return
-        if time.time() - last > SHARED_CACHE_MAX_AGE_S or snap.get("error") is not None:
+        snap_order = snap.get("order")
+        if snap_order is not None:
+            if isinstance(snap_order, bool) or not isinstance(snap_order, (int, float)) \
+                    or not math.isfinite(snap_order) or not math.isfinite(last):
+                return  # malformed: skip so the fallback scan recovers
+        own_order = self._cache.get("order")
+        if (own_order is not None and snap_order is not None
+                and snap.get("boot_id") == self._cache.get("boot_id")):
+            # same boot: order by the monotonic scan stamp, not wall clock
+            if float(snap_order) <= float(own_order):
+                return
+        elif snap_order is not None and own_order is None:
+            pass  # new-format snapshot supersedes a legacy/unordered cache
+        elif last <= float(self._cache.get("last_poll") or 0):
+            return
+        age = _snapshot_age(snap)
+        # negative age = clock moved backward since publish: don't trust it
+        if age > SHARED_CACHE_MAX_AGE_S or age < -60 or snap.get("error") is not None:
             return
         for key in ("prs", "aw_run_prs", "aw_run_attention", "failing_flows", "counts", "errors"):
             if key in snap:
                 self._cache[key] = snap[key]
         self._cache["error"] = None
         self._cache["last_poll"] = last
+        self._cache["order"] = snap.get("order")
+        self._cache["boot_id"] = snap.get("boot_id")
         self._adopted = True
 
-    def _persist_shared_cache(self) -> None:
+    def _persist_shared_cache(self, snapshot: dict) -> None:
+        """Blocking (flock + file IO): call via ``asyncio.to_thread``.
+        Newer-wins under the cross-process lock, ordered by the scan's
+        monotonic start stamp (+ boot_id), NOT wall-clock, so a clock
+        adjustment can neither block nor reorder publication."""
         if not self._cache_path:
             return
         try:
-            save_surfaced_store(self._cache_path, dict(self._cache))
+            with locked_store(self._cache_path):
+                current = load_surfaced_store(self._cache_path)
+                if current.get("boot_id") == snapshot.get("boot_id"):
+                    try:
+                        published = float(current.get("order"))
+                    except (TypeError, ValueError):
+                        published = None
+                    if published is not None and published >= snapshot["order"]:
+                        return
+                save_surfaced_store(self._cache_path, snapshot)
         except Exception as e:  # never break the poll over the snapshot
             log.warning("github maintenance shared cache write failed: %s", e)
 
@@ -1011,8 +1069,9 @@ class MaintenanceWatchdog:
             self._inflight = asyncio.ensure_future(self.poll())
         return self._inflight
 
-    async def poll(self, now: "float | None" = None) -> None:
+    async def poll(self, now: "float | None" = None, order: "float | None" = None) -> None:
         now = now if now is not None else time.time()
+        order = order if order is not None else time.monotonic()
         try:
             scope = self._scope_fn() if self._scope_fn is not None else None
             result = await scan_maintenance(
@@ -1032,9 +1091,12 @@ class MaintenanceWatchdog:
             log.warning("github maintenance scan failed: %s", e)
             self._cache["error"] = str(e)
         self._cache["last_poll"] = now
+        self._cache["order"] = order
+        self._cache["boot_id"] = _boot_id()
         self._adopted = False
         if self._cache["error"] is None:
-            self._persist_shared_cache()
+            snapshot = dict(self._cache, order=order, boot_id=_boot_id())
+            await asyncio.to_thread(self._persist_shared_cache, snapshot)
 
 
 __all__ = [
