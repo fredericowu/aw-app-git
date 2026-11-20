@@ -239,10 +239,28 @@ def test_previous_woken_verdict_does_not_hide_pr_during_nudge_outage(env):
     r2 = tc.get("/github/maintenance?limit=20").json()
     assert [p["number"] for p in r2["prs"]] == [7] and r2["has_work"] is True
     assert "AP-MT down" in r2["aw_run"]["error"]
+    assert r2["prs"][0]["aw_run"] == {"fallback": True}
     # a later successful nudge clears the outage and replays verdicts again
     state["fail"] = None
     assert tc.get("/github/maintenance?nudge=true").json()["prs"] == []
     assert tc.get("/github/maintenance").json()["prs"] == []
+
+
+def test_failed_live_recheck_keeps_outage_for_manager_reread(env):
+    tc, app, state, _ = env
+    state["verdict"] = "woken"
+    _warm(app, tagged=[_tagged()], attention=[_att()])
+    assert tc.get("/github/maintenance?nudge=true").json()["prs"] == []
+    state["fail"] = "AP-MT down"
+    tc.get("/github/maintenance?nudge=true")
+
+    async def gh_fail(args):
+        return 1, "", "gh: network error"
+    app._maintenance._gh_runner = gh_fail
+    r = tc.get("/github/maintenance?nudge=true").json()
+    assert [p["number"] for p in r["prs"]] == [7] and "live re-check failed" in r["aw_run"]["error"]
+    r2 = tc.get("/github/maintenance?limit=20").json()
+    assert [p["number"] for p in r2["prs"]] == [7] and r2["has_work"] is True
 
 
 def test_call_exceeding_wall_clock_deadline_fails_open(env, monkeypatch):

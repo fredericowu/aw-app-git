@@ -280,6 +280,11 @@ async def run_nudge(*, tagged: list, gh_runner, store_path: str, now: "float | N
     now = now if now is not None else time.time()
     started = time.monotonic()
     result = await _run_nudge(tagged, gh_runner, store_path, now, dry_run, client, started)
+    unverified = [d for d in result.get("dropped") or [] if str(d.get("reason", "")).startswith("live re-check")]
+    if unverified and not result.get("error"):
+        # A PR whose live state could not be read is not a confirmed closure:
+        # keep the fail-open decision (and the outage marker) for the Manager.
+        result["error"] = f"live re-check failed for {len(unverified)} PR(s): {unverified[0]['reason']}"
     if not dry_run:
         if result.get("error"):
             mark_outage(store_path, now, result["error"])

@@ -574,7 +574,8 @@ class GitAppPlugin:
                 mgr, applied = [], set()
             else:
                 mgr, applied = aw_run_nudge.manager_prs(store, live_keys, now_ts)
-            fallback = [e for e in (cached.get("aw_run_attention") or [])
+            fallback = [{**e, "aw_run": {"fallback": True}}
+                        for e in (cached.get("aw_run_attention") or [])
                         if aw_run_nudge.pr_key(e) not in applied
                         and aw_run_nudge.pr_key(e) in live_keys]
             block = aw_run_nudge.summarize(store, live_keys, applied, now_ts)
