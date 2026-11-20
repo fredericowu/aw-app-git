@@ -707,3 +707,15 @@ def test_new_format_snapshot_supersedes_a_legacy_adopted_one(tmp_path):
         "last_poll": base - 30, "order": time.monotonic(),
         "boot_id": github_maintenance._boot_id(), "error": None})
     assert len(warm.get_cached()["prs"]) == 1
+
+
+@pytest.mark.parametrize("bad", ["bad", float("nan"), float("inf"), True, [1]])
+def test_malformed_snapshot_order_is_skipped_not_a_500(setup, tmp_path, bad):
+    import time
+    tc, app, _, _ = setup
+    github_maintenance.save_surfaced_store(str(tmp_path / "cache.json"), {
+        "prs": [], "failing_flows": [], "counts": {}, "errors": [],
+        "last_poll": time.time(), "order": bad,
+        "boot_id": github_maintenance._boot_id(), "error": None})
+    # get_cached() is what the route calls first; it must not raise (-> 500)
+    assert app._maintenance.get_cached()["last_poll"] == 0

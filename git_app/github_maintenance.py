@@ -54,6 +54,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import json
+import math
 import logging
 import os
 import re
@@ -984,6 +985,12 @@ class MaintenanceWatchdog:
         return dict(self._cache)
 
     def _adopt_shared_cache(self) -> None:
+        try:
+            self._adopt_shared_cache_unsafe()
+        except (TypeError, ValueError, AttributeError, OverflowError) as e:
+            log.warning("github maintenance: ignoring malformed shared snapshot: %s", e)
+
+    def _adopt_shared_cache_unsafe(self) -> None:
         """Adopt the cross-worker snapshot when it is newer than this
         worker's own (or this worker is cold) and not stale."""
         if not self._cache_path:
@@ -995,7 +1002,12 @@ class MaintenanceWatchdog:
             return
         if not last:
             return
-        own_order, snap_order = self._cache.get("order"), snap.get("order")
+        snap_order = snap.get("order")
+        if snap_order is not None:
+            if isinstance(snap_order, bool) or not isinstance(snap_order, (int, float)) \
+                    or not math.isfinite(snap_order) or not math.isfinite(last):
+                return  # malformed: skip so the fallback scan recovers
+        own_order = self._cache.get("order")
         if (own_order is not None and snap_order is not None
                 and snap.get("boot_id") == self._cache.get("boot_id")):
             # same boot: order by the monotonic scan stamp, not wall clock
