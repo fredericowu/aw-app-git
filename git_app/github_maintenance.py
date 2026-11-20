@@ -375,6 +375,15 @@ def _boot_id() -> str:
         return ""
 
 
+def _snapshot_age(snap_or_cache: dict) -> float:
+    """Age in seconds. Same boot + monotonic order stamp -> monotonic age
+    (immune to wall-clock steps); otherwise wall-clock age."""
+    order = snap_or_cache.get("order")
+    if order is not None and snap_or_cache.get("boot_id") == _boot_id():
+        return time.monotonic() - float(order)
+    return time.time() - float(snap_or_cache.get("last_poll") or 0)
+
+
 def default_cache_path() -> str:
     home = os.environ.get("AW_WORKSPACE_HOME") or os.path.expanduser("~/.aw-workspace")
     return os.path.join(home, CACHE_REL)
@@ -963,7 +972,7 @@ class MaintenanceWatchdog:
 
     def get_cached(self) -> dict:
         self._adopt_shared_cache()
-        age = time.time() - float(self._cache.get("last_poll") or 0)
+        age = _snapshot_age(self._cache)
         if self._adopted and (age > SHARED_CACHE_MAX_AGE_S or age < -60):
             # An adopted snapshot keeps its age limit: leader stopped
             # publishing -> go cold so the route re-scans, not serve stale.
@@ -994,7 +1003,7 @@ class MaintenanceWatchdog:
                 return
         elif last <= float(self._cache.get("last_poll") or 0):
             return
-        age = time.time() - last
+        age = _snapshot_age(snap)
         # negative age = clock moved backward since publish: don't trust it
         if age > SHARED_CACHE_MAX_AGE_S or age < -60 or snap.get("error") is not None:
             return
