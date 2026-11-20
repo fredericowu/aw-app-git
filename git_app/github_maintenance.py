@@ -1041,9 +1041,16 @@ class MaintenanceWatchdog:
             with locked_store(self._cache_path):
                 current = load_surfaced_store(self._cache_path)
                 if current.get("boot_id") == snapshot.get("boot_id"):
+                    published = current.get("order")
+                    # same validity rule as the reader (_adopt): real finite
+                    # number only; anything else is corrupt -> overwrite it
                     try:
-                        published = float(current.get("order"))
-                    except (TypeError, ValueError):
+                        valid = (not isinstance(published, bool)
+                                 and isinstance(published, (int, float))
+                                 and math.isfinite(published))
+                    except OverflowError:  # e.g. a JSON int like 10**400
+                        valid = False
+                    if not valid:
                         published = None
                     if published is not None and published >= snapshot["order"]:
                         return

@@ -719,3 +719,18 @@ def test_malformed_snapshot_order_is_skipped_not_a_500(setup, tmp_path, bad):
         "boot_id": github_maintenance._boot_id(), "error": None})
     # get_cached() is what the route calls first; it must not raise (-> 500)
     assert app._maintenance.get_cached()["last_poll"] == 0
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan"), "500", True, [1], 10**400])
+def test_publish_overwrites_a_non_finite_on_disk_order(tmp_path, monkeypatch, bad):
+    path = str(tmp_path / "cache.json")
+    github_maintenance.save_surfaced_store(path, {
+        "prs": [], "failing_flows": [], "counts": {}, "errors": [], "last_poll": 1.0,
+        "order": bad, "boot_id": github_maintenance._boot_id(), "error": None})
+
+    async def scan(**kw):
+        return {"prs": [_pr()], "failing_flows": [], "counts": {}, "errors": []}
+    monkeypatch.setattr(github_maintenance, "scan_maintenance", scan)
+    asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(order=5.0))
+    snap = github_maintenance.load_surfaced_store(path)
+    assert snap["order"] == 5.0 and len(snap["prs"]) == 1
