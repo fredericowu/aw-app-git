@@ -76,7 +76,7 @@ DEFAULT_POLL_INTERVAL_S = 1800.0  # ~30min
 
 ATTENTION_BADGES = {"tests-failed", "ready-to-merge", "needs-review"}
 
-SEARCH_FIELDS = "number,repository,title,url,updatedAt,isDraft,createdAt,author,labels"
+SEARCH_FIELDS = "number,repository,title,url,updatedAt,isDraft,createdAt,author,authorAssociation,labels"
 VIEW_FIELDS = "statusCheckRollup,reviewDecision,mergeable,isDraft,updatedAt"
 
 # Same reasoning as pr_scan.py's own SEARCH_LIMIT (code-review finding, PR
@@ -672,6 +672,8 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
         entry = {
             "repo": full_name, "number": pr.get("number"), "url": pr.get("url"),
             "title": pr.get("title"), "author": (pr.get("author") or {}).get("login"),
+            # As of the last search pass; missing from gh -> None, never a guess.
+            "author_association": pr.get("authorAssociation") or None,
             "badge": badge, "updated_at": updated_at, "age_hours": age_hours,
             "attention_reason": "; ".join(reasons),
         }
