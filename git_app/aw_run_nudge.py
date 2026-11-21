@@ -411,7 +411,7 @@ def manager_prs(store: dict, tagged_keys: "set[str]", now: float) -> "tuple[list
         detail = e.get("reason")
         prs.append({
             "repo": e.get("repo"), "number": e.get("number"), "url": e.get("url"),
-            "title": e.get("title"), "author": None, "badge": None,
+            "title": e.get("title"), "author": None, "author_association": None, "badge": None,
             "updated_at": e.get("updated_at"), "age_hours": None,
             "attention_reason": f"aw-run: {reason}" + (f" ({detail})" if detail else ""),
             "aw_run": {"verdict": reason, "run_id": e.get("run_id"),

@@ -394,6 +394,30 @@ def test_tests_failed_badge_and_stale_pr_both_surface_with_reasons():
     assert "tekflox/aw-app-kb#7" in store
 
 
+def _failing_view(pr):
+    return {"statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}],
+            "reviewDecision": "", "mergeable": "MERGEABLE", "isDraft": False,
+            "updatedAt": pr["updatedAt"]}
+
+
+def test_author_association_passes_through_to_attention_entry():
+    pr = _search_pr(8, updated_hours_ago=30)
+    pr["authorAssociation"] = "MEMBER"
+    result, _ = _sweep({"tekflox": [pr]}, view_responses={pr["url"]: _failing_view(pr)})
+    assert result["attention"][0]["author_association"] == "MEMBER"
+
+
+def test_author_association_is_null_when_search_row_lacks_it():
+    pr = _search_pr(9, updated_hours_ago=30)
+    result, _ = _sweep({"tekflox": [pr]}, view_responses={pr["url"]: _failing_view(pr)})
+    assert result["attention"][0]["author_association"] is None
+
+
+def test_search_requests_author_association_but_view_does_not():
+    assert "authorAssociation" in gm.SEARCH_FIELDS.split(",")
+    assert "authorAssociation" not in gm.VIEW_FIELDS.split(",")
+
+
 def test_fresh_pr_with_no_ci_configured_never_surfaces_but_is_still_probed():
     """No CI rollup + an approved review classifies as badge "open" (not
     "ready-to-merge" — that needs a passed CI run too), and the PR is fresh
