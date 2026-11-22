@@ -66,11 +66,15 @@ ACTIVE_VERDICT_MAX_AGE_S = float(os.environ.get("AW_GIT_ACTIVE_VERDICT_MAX_AGE_S
 PASSIVE_VERDICTS = frozenset({"recent", "waiting_ci", "active"})
 
 #: Fallback for an AP-MT that predates the per-verdict ``hand_to_manager`` flag.
+#: ``needs_human_label`` is legacy: the ``devteam:needs-human`` PR label is
+#: retired (human-needed state lives on the Kanban card / ``ask_human``), kept
+#: here only so a stray label or an older AP-MT still escalates, never nudges.
 HAND_TO_MANAGER = frozenset({"escalate", "unresolvable", "needs_human_label", "stuck_active"})
 
 REVIEW_FIELDS = ("state,headRefOid,labels,isDraft,mergeable,mergeStateStatus,statusCheckRollup,"
                  "reviewDecision,updatedAt")
 
+#: Retired label; read only to tolerate a stray one on an old PR.
 NEEDS_HUMAN_LABEL = "devteam:needs-human"
 MERGE_ELIGIBLE_CONTEXT = "devteam/merge-eligible"
 #: The shared workflow's own contexts (code-review-reusable.yml, merge-attempt's
@@ -210,7 +214,8 @@ def parse_json_arrays(text: str) -> list:
 
 
 def needs_human_actor(events: list) -> str:
-    """bot / human / unknown: who applied the CURRENT ``devteam:needs-human``
+    """bot / human / unknown: who applied the CURRENT (stray, retired)
+    ``devteam:needs-human``
     (the last ``labeled`` event for it). Anything unreadable is ``unknown``,
     which AP-MT treats like a human."""
     last = None
@@ -285,7 +290,7 @@ async def live_recheck(tagged: list, gh_runner, *, concurrency: int = gm.GH_MAX_
         if not run_id:
             dropped.append({**_ident(pr), "reason": "aw-run label removed"})
             return
-        # Timeline only for a PR that is labelled needs-human: it is the one
+        # Timeline only for a PR with a stray (retired) needs-human label: the one
         # extra call per PR, and the only row that needs the actor.
         by = await read_needs_human_by(pr, gh_runner) if NEEDS_HUMAN_LABEL in labels else None
         # Stale-label state is recomputed from the LIVE labels, CI and activity,
