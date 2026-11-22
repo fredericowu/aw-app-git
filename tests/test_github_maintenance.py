@@ -1151,3 +1151,23 @@ def test_filter_open_prs_drops_merged_and_closed_and_fails_open():
     keep, gone = asyncio.run(gm.filter_open_prs(entries, runner))
     assert [e["number"] for e in keep] == [3, 4]  # 4: unreadable → kept
     assert [e["number"] for e in gone] == [1, 2]
+
+
+def test_default_gh_runner_kills_child_when_cancelled(monkeypatch, tmp_path):
+    import os
+    import pytest
+    fake = tmp_path / "gh"
+    fake.write_text(f"#!/bin/sh\necho $$ > {tmp_path}/pid\nexec sleep 30\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+
+    async def go():
+        task = asyncio.ensure_future(gm.default_gh_runner(["pr", "view"]))
+        await asyncio.sleep(0.5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(go())
+    pid = int((tmp_path / "pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

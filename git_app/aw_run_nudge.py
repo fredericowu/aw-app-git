@@ -29,6 +29,7 @@ import time
 import httpx
 
 from . import github_maintenance as gm
+from . import github_prs
 
 log = logging.getLogger("aw_apps.git.aw_run_nudge")
 
@@ -67,7 +68,8 @@ PASSIVE_VERDICTS = frozenset({"recent", "waiting_ci", "active"})
 #: Fallback for an AP-MT that predates the per-verdict ``hand_to_manager`` flag.
 HAND_TO_MANAGER = frozenset({"escalate", "unresolvable", "needs_human_label", "stuck_active"})
 
-REVIEW_FIELDS = "state,headRefOid,labels,isDraft,mergeable,mergeStateStatus,statusCheckRollup"
+REVIEW_FIELDS = ("state,headRefOid,labels,isDraft,mergeable,mergeStateStatus,statusCheckRollup,"
+                 "reviewDecision,updatedAt")
 
 NEEDS_HUMAN_LABEL = "devteam:needs-human"
 MERGE_ELIGIBLE_CONTEXT = "devteam/merge-eligible"
@@ -286,8 +288,16 @@ async def live_recheck(tagged: list, gh_runner, *, concurrency: int = gm.GH_MAX_
         # Timeline only for a PR that is labelled needs-human: it is the one
         # extra call per PR, and the only row that needs the actor.
         by = await read_needs_human_by(pr, gh_runner) if NEEDS_HUMAN_LABEL in labels else None
+        # Stale-label state is recomputed from the LIVE labels, CI and activity,
+        # never carried over from the cached scan (a push may have cleared it).
+        badge, ci = github_prs.classify_pr(view)
+        updated_at = view.get("updatedAt") or pr.get("updated_at")
+        at = _parse_ts(updated_at)
+        age_hours = None if at is None else (time.time() - at) / 3600.0
+        stale = gm.stale_devteam_labels(labels, ci, view.get("mergeable"), age_hours)
         still_open.append({**pr, "head_sha": view.get("headRefOid") or "", "labels": labels,
-                           "run_id": run_id, "facts": build_facts(view, labels, by)})
+                           "run_id": run_id, "facts": build_facts(view, labels, by),
+                           "stale_labels": stale, "badge": badge, "updated_at": updated_at})
 
     await gm._bounded_gather(tagged, _one, concurrency=concurrency)
     return still_open, dropped
@@ -370,7 +380,10 @@ def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> 
                  "title": pr.get("title"), "updated_at": pr.get("updated_at")}
         if verdict == "active":
             # First time seen active starts the clock; consecutive actives keep it.
-            entry["active_since"] = prior.get("active_since") if prior.get("verdict") in ("active", "stuck_active") \
+            # The clock belongs to a run: a different tagged run starts afresh.
+            same_run = prior.get("run_id") == entry["run_id"]
+            entry["active_since"] = prior.get("active_since") if same_run \
+                and prior.get("verdict") in ("active", "stuck_active") \
                 and prior.get("active_since") else now
         flag = v.get("hand_to_manager")
         handoff = flag if flag is not None else verdict in HAND_TO_MANAGER
@@ -380,7 +393,14 @@ def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> 
                                f"{_fmt_hours(now - entry['active_since'])} with no PR activity")
             handoff = True
         elif not handoff and verdict in PASSIVE_VERDICTS and pr.get("stale_labels"):
+            # Distinct verdict: the Manager routes it by the preserved badge and
+            # author association (the ordinary per-PR route), not as an aw-run reason.
+            entry["underlying_verdict"] = verdict
+            entry["verdict"] = "stale_labels"
             entry["reason"] = "stale labels on green PR: " + ", ".join(pr["stale_labels"])
+            entry.update({"stale_labels": list(pr["stale_labels"]), "badge": pr.get("badge"),
+                          "author": pr.get("author"),
+                          "author_association": pr.get("author_association")})
             handoff = True
         if handoff:
             state = gm.surfaced_backoff_state(pr.get("updated_at"), prior.get("stamp"), now)
@@ -460,11 +480,15 @@ def manager_prs(store: dict, tagged_keys: "set[str]", now: float) -> "tuple[list
                 continue
             reason = "stuck_active"
             detail = f"aw-run chain reads active with no PR activity for {_fmt_hours(now - (_parse_ts(e.get('updated_at')) or now))}"
+        stale_row = reason == "stale_labels"
         prs.append({
             "repo": e.get("repo"), "number": e.get("number"), "url": e.get("url"),
-            "title": e.get("title"), "author": None, "author_association": None, "badge": None,
+            "title": e.get("title"), "author": e.get("author") if stale_row else None,
+            "author_association": e.get("author_association") if stale_row else None,
+            "badge": e.get("badge") if stale_row else None,
             "updated_at": e.get("updated_at"), "age_hours": None,
-            "attention_reason": f"aw-run: {reason}" + (f" ({detail})" if detail else ""),
+            "attention_reason": (detail if stale_row and detail else
+                                 f"aw-run: {reason}" + (f" ({detail})" if detail else "")),
             "aw_run": {"verdict": reason, "run_id": e.get("run_id"),
                        "wake_count": e.get("wake_count")},
         })

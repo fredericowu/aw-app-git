@@ -125,6 +125,14 @@ async def default_gh_runner(args: list) -> "tuple[int, str, str]":
         proc.kill()
         await proc.wait()
         return 124, "", f"gh {' '.join(args)} timed out after {GH_TIMEOUT_S}s"
+    except asyncio.CancelledError:
+        # A caller's deadline cancelled us mid-flight: do not orphan the child.
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        raise
     return (proc.returncode or 0), stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
 
@@ -674,6 +682,8 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
             aw_run_prs.append({
                 "repo": full_name, "number": pr.get("number"), "url": pr.get("url"),
                 "title": pr.get("title"), "run_id": run_id,
+                "author": (pr.get("author") or {}).get("login"),
+                "author_association": pr.get("authorAssociation") or None,
                 "labels": label_names(pr.get("labels")), "is_draft": bool(pr.get("isDraft")),
                 "updated_at": pr.get("updatedAt"),
             })
@@ -735,6 +745,7 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
                 for t in aw_run_prs:
                     if _pr_key(t["repo"], t["number"]) == key:
                         t["stale_labels"] = stale
+                        t["badge"] = badge
             return
         attention.append(entry)
         store[key] = {"surfaced_at": now, "updated_at": updated_at}
