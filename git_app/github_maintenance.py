@@ -76,6 +76,13 @@ DEFAULT_POLL_INTERVAL_S = 1800.0  # ~30min
 
 ATTENTION_BADGES = {"tests-failed", "ready-to-merge", "needs-review"}
 
+#: Workflow-state labels that mean "an agent is mid-fix". On a PR whose CI is
+#: green and that has been idle for ``STALE_LABEL_IDLE_HOURS`` they are stale:
+#: nobody is working, nothing is merging it, and the badge alone may not
+#: surface it (e.g. ``open`` while a late advisory check settles).
+STALE_DEVTEAM_LABELS = frozenset({"devteam:awaiting-fixes", "devteam:fix-cycle"})
+STALE_LABEL_IDLE_HOURS = 1.0
+
 SEARCH_FIELDS = "number,repository,title,url,updatedAt,isDraft,createdAt,author,authorAssociation,labels"
 VIEW_FIELDS = "statusCheckRollup,reviewDecision,mergeable,isDraft,updatedAt"
 
@@ -118,6 +125,14 @@ async def default_gh_runner(args: list) -> "tuple[int, str, str]":
         proc.kill()
         await proc.wait()
         return 124, "", f"gh {' '.join(args)} timed out after {GH_TIMEOUT_S}s"
+    except asyncio.CancelledError:
+        # A caller's deadline cancelled us mid-flight: do not orphan the child.
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        raise
     return (proc.returncode or 0), stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
 
@@ -583,6 +598,46 @@ def _pr_key(full_name: str, number: Any) -> str:
 
 # ── PR attention sweep ───────────────────────────────────────────────────
 
+def stale_devteam_labels(labels: Any, ci: str, mergeable: "str | None",
+                         age_hours: "float | None") -> list:
+    """Stale ``devteam:*`` workflow labels on a green, non-conflicting PR that
+    has been idle long enough that no agent can be mid-flight. ``[]`` if none."""
+    if ci != "passed" or (mergeable or "").upper() == "CONFLICTING":
+        return []
+    if age_hours is None or age_hours < STALE_LABEL_IDLE_HOURS:
+        return []
+    return sorted(set(label_names(labels)) & STALE_DEVTEAM_LABELS)
+
+
+async def filter_open_prs(entries: list, gh_runner: GhRunner, *, budget_s: float = 8.0,
+                          concurrency: int = GH_MAX_CONCURRENCY) -> "tuple[list, list]":
+    """``(still_open, gone)``: re-verify each entry's PR is OPEN right now. The
+    cached scan is up to a poll interval old, so a PR merged/closed since must
+    not reach the Manager. Fails OPEN: a PR whose state cannot be read (gh
+    error, malformed output, budget exceeded) is kept."""
+    gone_keys: set = set()
+
+    async def _one(e: dict) -> None:
+        try:
+            code, out, _ = await gh_runner(["pr", "view", e["url"], "--json", "state"])
+            if code != 0:
+                return
+            state = str(json.loads(out or "{}").get("state") or "").upper()
+        except Exception:
+            return
+        if state and state != "OPEN":
+            gone_keys.add(_pr_key(e.get("repo"), e.get("number")))
+
+    try:
+        await asyncio.wait_for(_bounded_gather(entries, _one, concurrency=concurrency),
+                               timeout=budget_s)
+    except asyncio.TimeoutError:
+        pass
+    keep = [e for e in entries if _pr_key(e.get("repo"), e.get("number")) not in gone_keys]
+    gone = [e for e in entries if _pr_key(e.get("repo"), e.get("number")) in gone_keys]
+    return keep, gone
+
+
 async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_names: "set[str]",
                             owners: list, store: dict, stall_hours: float = DEFAULT_STALL_HOURS,
                             concurrency: int = GH_MAX_CONCURRENCY) -> dict:
@@ -627,6 +682,8 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
             aw_run_prs.append({
                 "repo": full_name, "number": pr.get("number"), "url": pr.get("url"),
                 "title": pr.get("title"), "run_id": run_id,
+                "author": (pr.get("author") or {}).get("login"),
+                "author_association": pr.get("authorAssociation") or None,
                 "labels": label_names(pr.get("labels")), "is_draft": bool(pr.get("isDraft")),
                 "updated_at": pr.get("updatedAt"),
             })
@@ -666,6 +723,9 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
             reasons.append(f"badge:{badge}")
         if stalled:
             reasons.append(f"stalled {age_hours}h (>{stall_hours}h)")
+        stale = stale_devteam_labels(pr.get("labels"), _ci, view.get("mergeable"), age_hours)
+        if stale:
+            reasons.append(f"stale labels on green PR: {', '.join(stale)}")
         if not reasons:
             return
 
@@ -677,8 +737,15 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
             "badge": badge, "updated_at": updated_at, "age_hours": age_hours,
             "attention_reason": "; ".join(reasons),
         }
+        if stale:
+            entry["stale_labels"] = stale
         if tagged:
             aw_run_attention.append(entry)
+            if stale:
+                for t in aw_run_prs:
+                    if _pr_key(t["repo"], t["number"]) == key:
+                        t["stale_labels"] = stale
+                        t["badge"] = badge
             return
         attention.append(entry)
         store[key] = {"surfaced_at": now, "updated_at": updated_at}

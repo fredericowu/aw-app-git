@@ -684,6 +684,19 @@ class GitAppPlugin:
                     prs_list.extend(cached.get("aw_run_attention") or [])
                     aw_run_block = {"error": f"{type(exc).__name__}: {exc}"}
 
+            # The scan is up to a poll interval old and the verdict store replays
+            # older decisions: re-verify every surfaced PR is still OPEN so a PR
+            # merged/closed since never reaches the Manager. Fails open.
+            prs_list, closed = await github_maintenance.filter_open_prs(
+                prs_list, maintenance._gh_runner)
+            if closed:
+                log.info("maintenance gate dropped %d closed/merged PR(s): %s", len(closed),
+                         [f"{e.get('repo')}#{e.get('number')}" for e in closed])
+                if aw_run_block is not None:
+                    aw_run_block["closed_dropped"] = [
+                        {"repo": e.get("repo"), "number": e.get("number"), "url": e.get("url")}
+                        for e in closed]
+
             result = {
                 "has_work": bool(prs_list) or bool(failing_flows),
                 "prs": prs_list[:limit],

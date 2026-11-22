@@ -488,3 +488,115 @@ def test_hand_to_manager_flag_from_ap_mt_wins_over_the_verdict_name():
 
 def test_bot_detected_by_actor_type_alone():
     assert aw_run_nudge.needs_human_actor([_ev("devteam:needs-human", "devteam-app", "Bot")]) == "bot"
+
+
+# ── expiry of an ``active`` verdict (dead run still reads active) ────────
+
+H = 3600.0
+NOWT = 1_800_000_000.0
+
+
+def _iso_ago(hours):
+    import datetime as dt
+    return dt.datetime.fromtimestamp(NOWT - hours * H, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _tagged_pr(updated_hours_ago, **extra):
+    return {"repo": "o/r", "number": 6, "url": "https://github.com/o/r/pull/6",
+            "title": "t", "run_id": RID, "updated_at": _iso_ago(updated_hours_ago), **extra}
+
+
+def _active_v():
+    return {"repo": "o/r", "number": 6, "url": "https://github.com/o/r/pull/6",
+            "verdict": "active", "run_id": RID}
+
+
+def test_active_verdict_within_max_age_is_not_handed_over():
+    pr = _tagged_pr(0.5)
+    store = aw_run_nudge.plan_nudge_result([pr], [_active_v()], {}, NOWT)
+    e = store["o/r#6"]
+    assert e["verdict"] == "active" and e["handed_off"] is False and e["active_since"] == NOWT
+
+
+def test_active_verdict_expires_to_stuck_active_when_pr_idle_too():
+    pr = _tagged_pr(5)
+    first = aw_run_nudge.plan_nudge_result([pr], [_active_v()], {}, NOWT - 3 * H)
+    store = aw_run_nudge.plan_nudge_result([pr], [_active_v()], first, NOWT)
+    e = store["o/r#6"]
+    assert e["verdict"] == "stuck_active" and e["handed_off"] is True
+    assert e["active_since"] == NOWT - 3 * H  # the clock is not reset by the rewrite
+    mgr, applied = aw_run_nudge.manager_prs(store, {"o/r#6"}, NOWT)
+    assert [p["attention_reason"].startswith("aw-run: stuck_active") for p in mgr] == [True]
+
+
+def test_active_verdict_does_not_expire_while_pr_is_moving():
+    pr = _tagged_pr(0.2)  # a push 12 minutes ago: the agent is alive
+    first = aw_run_nudge.plan_nudge_result([pr], [_active_v()], {}, NOWT - 3 * H)
+    store = aw_run_nudge.plan_nudge_result([pr], [_active_v()], first, NOWT)
+    assert store["o/r#6"]["verdict"] == "active" and not store["o/r#6"]["handed_off"]
+
+
+def test_plain_get_expires_a_stored_active_verdict_on_read():
+    store = {"o/r#6": {"verdict": "active", "at": NOWT - 0.5 * H, "handed_off": False,
+                       "active_since": NOWT - 3 * H, "repo": "o/r", "number": 6,
+                       "url": "u", "updated_at": _iso_ago(4)}}
+    mgr, applied = aw_run_nudge.manager_prs(store, {"o/r#6"}, NOWT)
+    assert len(mgr) == 1 and "stuck_active" in mgr[0]["attention_reason"]
+    store["o/r#6"]["active_since"] = NOWT - 0.5 * H
+    assert aw_run_nudge.manager_prs(store, {"o/r#6"}, NOWT)[0] == []
+
+
+@pytest.mark.parametrize("verdict", ["recent", "waiting_ci", "active"])
+def test_passive_verdict_on_green_pr_with_stale_labels_goes_to_manager(verdict):
+    pr = _tagged_pr(3, stale_labels=["devteam:awaiting-fixes"])
+    v = {**_active_v(), "verdict": verdict}
+    store = aw_run_nudge.plan_nudge_result([pr], [v], {}, NOWT)
+    assert store["o/r#6"]["handed_off"] is True
+    assert "stale labels" in store["o/r#6"]["reason"]
+
+
+def test_passive_verdict_without_stale_labels_stays_hidden():
+    store = aw_run_nudge.plan_nudge_result([_tagged_pr(3)], [{**_active_v(), "verdict": "recent"}], {}, NOWT)
+    assert store["o/r#6"]["handed_off"] is False
+
+
+def test_woken_verdict_is_never_overridden_by_stale_labels():
+    pr = _tagged_pr(3, stale_labels=["devteam:fix-cycle"])
+    store = aw_run_nudge.plan_nudge_result([pr], [{**_active_v(), "verdict": "woken"}], {}, NOWT)
+    assert store["o/r#6"]["handed_off"] is False
+
+
+def test_stale_label_handoff_has_distinct_verdict_and_keeps_badge_and_author():
+    pr = _tagged_pr(3, stale_labels=["devteam:awaiting-fixes"], badge="ready-to-merge",
+                    author="octo", author_association="OWNER")
+    store = aw_run_nudge.plan_nudge_result([pr], [{**_active_v(), "verdict": "waiting_ci"}], {}, NOWT)
+    e = store["o/r#6"]
+    assert e["verdict"] == "stale_labels" and e["underlying_verdict"] == "waiting_ci"
+    mgr, _ = aw_run_nudge.manager_prs(store, {"o/r#6"}, NOWT)
+    assert mgr[0]["badge"] == "ready-to-merge" and mgr[0]["author_association"] == "OWNER"
+    assert mgr[0]["author"] == "octo"
+    assert not mgr[0]["attention_reason"].startswith("aw-run:")
+
+
+def test_live_recheck_recomputes_stale_labels_from_live_state():
+    import datetime as dt
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    green = {"statusCheckRollup": [_chk("test")], "updatedAt": old}
+    kept, _, _ = _recheck(_view([f"aw-run:{RID}", "devteam:fix-cycle"], **green))
+    assert kept[0]["stale_labels"] == ["devteam:fix-cycle"]
+    # a push removed the label and CI is pending again: nothing stale any more
+    kept, _, _ = _recheck(_view([f"aw-run:{RID}"], **green))
+    assert kept[0]["stale_labels"] == []
+    pending = {"statusCheckRollup": [_chk("test", status="IN_PROGRESS", conclusion="")], "updatedAt": old}
+    kept, _, _ = _recheck(_view([f"aw-run:{RID}", "devteam:fix-cycle"], **pending))
+    assert kept[0]["stale_labels"] == []
+
+
+def test_active_timer_resets_when_tagged_run_changes():
+    prior = {"o/r#6": {"verdict": "active", "run_id": "b" * 32, "active_since": NOWT - 3 * H}}
+    store = aw_run_nudge.plan_nudge_result([_tagged_pr(4)], [_active_v()], prior, NOWT)
+    assert store["o/r#6"]["active_since"] == NOWT
+    assert store["o/r#6"]["verdict"] == "active"
+    prior["o/r#6"]["run_id"] = RID
+    store = aw_run_nudge.plan_nudge_result([_tagged_pr(4)], [_active_v()], prior, NOWT)
+    assert store["o/r#6"]["active_since"] == NOWT - 3 * H

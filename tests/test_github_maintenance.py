@@ -1096,3 +1096,78 @@ def test_plan_pings_daily_summary_fires_once_then_waits_24h():
     plan3 = gm.plan_maintenance_pings([_flow()], plan2["state"], NOW + 25 * 3600)  # >24h later
     assert plan3["summary_due"] is True
     assert plan3["state"]["last_summary_at"] == NOW + 25 * 3600
+
+
+# ── stale devteam labels on a green PR; open-state re-verification ──────
+
+def _green_view(pr):
+    return {"statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+            "reviewDecision": "APPROVED", "mergeable": "MERGEABLE", "isDraft": False,
+            "updatedAt": pr["updatedAt"]}
+
+
+def test_green_pr_with_stale_devteam_labels_reaches_attention_even_if_fresh_badge_is_quiet():
+    pr = _search_pr(9, updated_hours_ago=3)
+    pr["labels"] = [{"name": "devteam:awaiting-fixes"}, {"name": "review-count:1"}]
+    view = {**_green_view(pr), "reviewDecision": "APPROVED", "mergeable": "UNKNOWN"}  # badge: open
+    result, _ = _sweep({"tekflox": [pr]}, view_responses={pr["url"]: view})
+    assert len(result["attention"]) == 1
+    assert "stale labels on green PR: devteam:awaiting-fixes" in result["attention"][0]["attention_reason"]
+    assert result["attention"][0]["stale_labels"] == ["devteam:awaiting-fixes"]
+
+
+def test_stale_labels_ignored_when_recently_updated_failing_or_unlabelled():
+    fresh = _search_pr(10, updated_hours_ago=0.2)
+    fresh["labels"] = [{"name": "devteam:fix-cycle"}]
+    plain = _search_pr(11, updated_hours_ago=3)
+    plain["labels"] = [{"name": "review-count:1"}]
+    quiet = {"statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+             "reviewDecision": "APPROVED", "mergeable": "UNKNOWN", "isDraft": False}
+    result, _ = _sweep({"tekflox": [fresh, plain]}, view_responses={
+        fresh["url"]: {**quiet, "updatedAt": fresh["updatedAt"]},
+        plain["url"]: {**quiet, "updatedAt": plain["updatedAt"]}})
+    assert result["attention"] == []
+
+
+def test_tagged_green_pr_with_stale_labels_is_flagged_on_aw_run_prs():
+    pr = _search_pr(12, updated_hours_ago=3)
+    pr["labels"] = [{"name": "devteam:awaiting-fixes"},
+                    {"name": "aw-run:23aeb5c610f6426284ad6fe4ad9f7fa5"}]
+    result, _ = _sweep({"tekflox": [pr]}, view_responses={pr["url"]: _green_view(pr)})
+    assert result["aw_run_prs"][0]["stale_labels"] == ["devteam:awaiting-fixes"]
+    assert result["aw_run_attention"][0]["stale_labels"] == ["devteam:awaiting-fixes"]
+
+
+def test_filter_open_prs_drops_merged_and_closed_and_fails_open():
+    states = {"o/r#1": "MERGED", "o/r#2": "CLOSED", "o/r#3": "OPEN"}
+
+    async def runner(args):
+        n = args[2].rsplit("/", 1)[1]
+        if n == "4":
+            return 1, "", "boom"
+        return 0, json.dumps({"state": states[f"o/r#{n}"]}), ""
+
+    entries = [{"repo": "o/r", "number": n, "url": f"https://github.com/o/r/pull/{n}"} for n in (1, 2, 3, 4)]
+    keep, gone = asyncio.run(gm.filter_open_prs(entries, runner))
+    assert [e["number"] for e in keep] == [3, 4]  # 4: unreadable → kept
+    assert [e["number"] for e in gone] == [1, 2]
+
+
+def test_default_gh_runner_kills_child_when_cancelled(monkeypatch, tmp_path):
+    import os
+    import pytest
+    fake = tmp_path / "gh"
+    fake.write_text(f"#!/bin/sh\necho $$ > {tmp_path}/pid\nexec sleep 30\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+
+    async def go():
+        task = asyncio.ensure_future(gm.default_gh_runner(["pr", "view"]))
+        await asyncio.sleep(0.5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(go())
+    pid = int((tmp_path / "pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
