@@ -83,6 +83,13 @@ ATTENTION_BADGES = {"tests-failed", "ready-to-merge", "needs-review"}
 STALE_DEVTEAM_LABELS = frozenset({"devteam:awaiting-fixes", "devteam:fix-cycle"})
 STALE_LABEL_IDLE_HOURS = 1.0
 
+#: A Dev Team PR (any of these label prefixes) open and untouched this long has
+#: no agent acting on it, whatever the reason (blocked on a review, a dead run, a
+#: verdict nobody routed). ``updatedAt`` moves on every push, label and comment,
+#: so it is the gate's proxy for "someone is working on it".
+DEVTEAM_PR_LABEL_PREFIXES = ("devteam:", "review-count:", "aw-agent:", "aw-run:")
+IDLE_OPEN_MINUTES = float(os.environ.get("AW_GIT_IDLE_OPEN_MINUTES") or 10)
+
 SEARCH_FIELDS = "number,repository,title,url,updatedAt,isDraft,createdAt,author,authorAssociation,labels"
 VIEW_FIELDS = "statusCheckRollup,reviewDecision,mergeable,isDraft,updatedAt"
 
@@ -598,6 +605,14 @@ def _pr_key(full_name: str, number: Any) -> str:
 
 # ── PR attention sweep ───────────────────────────────────────────────────
 
+def idle_open_devteam_pr(labels: Any, age_min: "float | None",
+                         idle_minutes: float = IDLE_OPEN_MINUTES) -> bool:
+    """A Dev Team PR untouched for ``idle_minutes``: nothing is acting on it."""
+    if age_min is None or age_min < idle_minutes:
+        return False
+    return any(n.startswith(DEVTEAM_PR_LABEL_PREFIXES) for n in label_names(labels))
+
+
 def stale_devteam_labels(labels: Any, ci: str, mergeable: "str | None",
                          age_hours: "float | None") -> list:
     """Stale ``devteam:*`` workflow labels on a green, non-conflicting PR that
@@ -713,8 +728,10 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
         badge, _ci = github_prs.classify_pr(view)
         updated_at = view.get("updatedAt") or pr.get("updatedAt")
         age_hours = None
+        age_min = None
         at = _parse_iso_datetime(updated_at)
         if at is not None:
+            age_min = (now - at) / 60.0
             age_hours = round((now - at) / 3600.0, 1)
         stalled = age_hours is not None and age_hours >= stall_hours
 
@@ -726,6 +743,9 @@ async def scan_pr_attention(*, now: float, gh_runner: GhRunner, cloned_full_name
         stale = stale_devteam_labels(pr.get("labels"), _ci, view.get("mergeable"), age_hours)
         if stale:
             reasons.append(f"stale labels on green PR: {', '.join(stale)}")
+        if idle_open_devteam_pr(pr.get("labels"), age_min):
+            reasons.append(f"idle_open: Dev Team PR open and untouched {round(age_min)}min "
+                           f"(>{IDLE_OPEN_MINUTES:g}min), no run acting on it")
         if not reasons:
             return
 

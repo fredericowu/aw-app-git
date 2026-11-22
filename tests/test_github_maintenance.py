@@ -1117,10 +1117,10 @@ def test_green_pr_with_stale_devteam_labels_reaches_attention_even_if_fresh_badg
 
 
 def test_stale_labels_ignored_when_recently_updated_failing_or_unlabelled():
-    fresh = _search_pr(10, updated_hours_ago=0.2)
+    fresh = _search_pr(10, updated_hours_ago=0.05)
     fresh["labels"] = [{"name": "devteam:fix-cycle"}]
     plain = _search_pr(11, updated_hours_ago=3)
-    plain["labels"] = [{"name": "review-count:1"}]
+    plain["labels"] = [{"name": "enhancement"}]
     quiet = {"statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
              "reviewDecision": "APPROVED", "mergeable": "UNKNOWN", "isDraft": False}
     result, _ = _sweep({"tekflox": [fresh, plain]}, view_responses={
@@ -1171,3 +1171,30 @@ def test_default_gh_runner_kills_child_when_cancelled(monkeypatch, tmp_path):
     pid = int((tmp_path / "pid").read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+def _quiet_view(pr):
+    return {"statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+            "reviewDecision": "APPROVED", "mergeable": "UNKNOWN", "isDraft": False,
+            "updatedAt": pr["updatedAt"]}
+
+
+def test_idle_devteam_pr_surfaces_as_idle_open_even_when_ci_is_green():
+    # PR aw-app-devteam#22: reviewed round 1, blocked, 15min untouched, no coder.
+    pr = _search_pr(22, updated_hours_ago=0.25)
+    pr["labels"] = [{"name": "devteam:reviewed"}, {"name": "review-count:1"}]
+    result, _ = _sweep({"tekflox": [pr]}, view_responses={pr["url"]: _quiet_view(pr)})
+    assert [e["number"] for e in result["attention"]] == [22]
+    assert "idle_open" in result["attention"][0]["attention_reason"]
+
+
+def test_idle_open_ignores_fresh_unlabelled_and_draft_prs():
+    fresh = _search_pr(30, updated_hours_ago=0.05)
+    fresh["labels"] = [{"name": "devteam:reviewed"}]
+    human = _search_pr(31, updated_hours_ago=3)
+    human["labels"] = [{"name": "enhancement"}]
+    draft = _search_pr(32, updated_hours_ago=3, is_draft=True)
+    draft["labels"] = [{"name": "devteam:reviewed"}]
+    result, _ = _sweep({"tekflox": [fresh, human, draft]}, view_responses={
+        p["url"]: _quiet_view(p) for p in (fresh, human, draft)})
+    assert result["attention"] == []

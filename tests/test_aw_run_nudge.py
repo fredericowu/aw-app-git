@@ -146,7 +146,8 @@ def test_escalate_hands_to_manager_with_aw_run_reason_then_backs_off(env):
 
 def test_untagged_prs_unchanged(env):
     tc, app, state, _ = env
-    _warm(app, prs=[_att(1)], tagged=[_tagged(7)], attention=[_att(7)])
+    fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # inside the idle_open grace
+    _warm(app, prs=[_att(1)], tagged=[{**_tagged(7), "updated_at": fresh}], attention=[_att(7)])
     state["verdict"] = "recent"
     r = tc.get("/github/maintenance?nudge=true").json()
     assert [p["number"] for p in r["prs"]] == [1] and r["has_work"] is True
@@ -556,7 +557,7 @@ def test_passive_verdict_on_green_pr_with_stale_labels_goes_to_manager(verdict):
 
 
 def test_passive_verdict_without_stale_labels_stays_hidden():
-    store = aw_run_nudge.plan_nudge_result([_tagged_pr(3)], [{**_active_v(), "verdict": "recent"}], {}, NOWT)
+    store = aw_run_nudge.plan_nudge_result([_tagged_pr(0.05)], [{**_active_v(), "verdict": "recent"}], {}, NOWT)
     assert store["o/r#6"]["handed_off"] is False
 
 
@@ -697,3 +698,52 @@ def test_new_ap_mt_verdicts_hand_to_manager_without_the_flag(verdict):
     store = aw_run_nudge.plan_nudge_result([_tagged_pr(3)], [{**_active_v(), "verdict": verdict,
                                                               "reason": "r"}], {}, NOWT)
     assert store["o/r#6"]["handed_off"] is True
+
+
+# ── idle_open: an open PR nobody is acting on must count as work ──────────
+
+@pytest.mark.parametrize("verdict", ["recent", "waiting_ci", "ask_failed", "ask_deferred"])
+def test_idle_tagged_pr_with_no_active_run_is_handed_to_manager(verdict):
+    pr = _tagged_pr(0.25)  # 15min untouched, the PR #22 shape
+    store = aw_run_nudge.plan_nudge_result([pr], [{**_active_v(), "verdict": verdict}], {}, NOWT)
+    e = store["o/r#6"]
+    assert e["verdict"] == "idle_open" and e["handed_off"] is True
+    assert e["underlying_verdict"] == verdict and "no run acting" in e["reason"]
+    prs, _ = aw_run_nudge.manager_prs(store, {"o/r#6"}, NOWT)
+    assert prs[0]["attention_reason"].startswith("aw-run: idle_open")
+
+
+@pytest.mark.parametrize("verdict,pr_kw,age", [
+    ("active", {}, 0.25),                      # a live run IS acting
+    ("woken", {}, 0.25),                       # a coder was just woken
+    ("recent", {}, 0.05),                      # 3min: inside the grace window
+    ("recent", {"is_draft": True}, 0.25),      # drafts are not review-ready
+    ("waiting_human", {}, 0.25),               # genuine human hold
+])
+def test_idle_open_does_not_fire_when_something_is_acting(verdict, pr_kw, age):
+    pr = _tagged_pr(age, **pr_kw)
+    e = aw_run_nudge.plan_nudge_result([pr], [{**_active_v(), "verdict": verdict}], {}, NOWT)["o/r#6"]
+    assert e["verdict"] != "idle_open" and e["handed_off"] is False
+
+
+def test_idle_open_keeps_a_pending_human_question_hold():
+    pr = _tagged_pr(0.25)
+    v = {**_active_v(), "verdict": "ask_failed", "question_id": "q1"}
+    e = aw_run_nudge.plan_nudge_result([pr], [v], {}, NOWT)["o/r#6"]
+    assert e["verdict"] != "idle_open"
+
+
+def test_idle_open_uses_live_draft_status_over_cached():
+    live_draft = {**_tagged_pr(0.25), "is_draft": False, "facts": {"draft": True}}
+    e = aw_run_nudge.plan_nudge_result([live_draft], [{**_active_v(), "verdict": "recent"}], {}, NOWT)["o/r#6"]
+    assert e["verdict"] != "idle_open"
+    live_ready = {**_tagged_pr(0.25), "is_draft": True, "facts": {"draft": False}}
+    e = aw_run_nudge.plan_nudge_result([live_ready], [{**_active_v(), "verdict": "recent"}], {}, NOWT)["o/r#6"]
+    assert e["verdict"] == "idle_open"
+
+
+def test_idle_open_zero_threshold_skips_unknown_timestamp(monkeypatch):
+    monkeypatch.setattr(aw_run_nudge.gm, "IDLE_OPEN_MINUTES", 0.0)
+    pr = {**_tagged_pr(0.25), "updated_at": None}
+    e = aw_run_nudge.plan_nudge_result([pr], [{**_active_v(), "verdict": "recent"}], {}, NOWT)["o/r#6"]
+    assert e["verdict"] != "idle_open"
