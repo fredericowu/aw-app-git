@@ -72,10 +72,19 @@ PASSIVE_VERDICTS = frozenset({"recent", "waiting_ci", "active"})
 HAND_TO_MANAGER = frozenset({"escalate", "unresolvable", "needs_human_label", "stuck_active"})
 
 REVIEW_FIELDS = ("state,headRefOid,labels,isDraft,mergeable,mergeStateStatus,statusCheckRollup,"
-                 "reviewDecision,updatedAt")
+                 "reviewDecision,updatedAt,headRefName")
 
 #: Retired label; read only to tolerate a stray one on an old PR.
 NEEDS_HUMAN_LABEL = "devteam:needs-human"
+#: Labels meaning a review left blocking findings on the CURRENT head. The
+#: shared workflow drops ``awaiting-fixes`` on the coder's push and keeps
+#: ``devteam:fix-cycle`` only as round history, so ``fix-cycle`` alone is not a
+#: pending-fix signal.
+BLOCKING_FIX_LABELS = ("devteam:awaiting-fixes",)
+#: AP-MT's ``unresolvable`` reason when the ``aw-run`` label id is unknown to it
+#: (matched only as a fallback for an AP-MT that does not send
+#: ``link_resolution: "unresolved"`` on the verdict).
+UNLINKED_REASON_PREFIX = "run not found for aw-run label"
 MERGE_ELIGIBLE_CONTEXT = "devteam/merge-eligible"
 #: The shared workflow's own contexts (code-review-reusable.yml, merge-attempt's
 #: ADVISORY set). They never gate a merge through raw pass/fail, so a red one
@@ -302,6 +311,7 @@ async def live_recheck(tagged: list, gh_runner, *, concurrency: int = gm.GH_MAX_
         stale = gm.stale_devteam_labels(labels, ci, view.get("mergeable"), age_hours)
         still_open.append({**pr, "head_sha": view.get("headRefOid") or "", "labels": labels,
                            "run_id": run_id, "facts": build_facts(view, labels, by),
+                           "head_ref": view.get("headRefName") or "",
                            "stale_labels": stale, "badge": badge, "updated_at": updated_at})
 
     await gm._bounded_gather(tagged, _one, concurrency=concurrency)
@@ -364,6 +374,28 @@ def active_expired(verdict, active_since, updated_at, now: float) -> bool:
     return upd is None or now - upd > ACTIVE_VERDICT_MAX_AGE_S
 
 
+def unlinked_fix_labels(verdict: dict, pr: dict) -> "list[str]":
+    """Blocking-findings labels on a PR whose ``aw-run`` id AP-MT cannot link
+    to any run, else ``[]``. No run means nobody to wake, and the PR would sit
+    with findings no one is fixing."""
+    if verdict.get("verdict") != "unresolvable":
+        return []
+    if NEEDS_HUMAN_LABEL in (pr.get("labels") or []):
+        return []  # human hold takes precedence over a coder dispatch
+    unlinked = verdict.get("link_resolution") == "unresolved" \
+        or str(verdict.get("reason") or "").startswith(UNLINKED_REASON_PREFIX)
+    if not unlinked:
+        return []
+    return [lb for lb in BLOCKING_FIX_LABELS if lb in (pr.get("labels") or [])]
+
+
+def unlinked_fix_reason(labels: list, head_ref: str, run_id) -> str:
+    branch = f"branch `{head_ref}`" if head_ref else "the PR's existing head branch"
+    return (f"{', '.join(labels)} but aw-run id {run_id} is unknown to AP-MT, so no run can be woken. "
+            f"Dispatch a fresh coder on {branch} of this open PR to fix the review findings. "
+            "Push to the same branch: no new PR, no /aw-review, no merge")
+
+
 def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> dict:
     """Fold fresh verdicts into the persisted store (pure; returns the new
     store). A Manager-bound verdict goes through the SAME surfaced back-off as
@@ -396,6 +428,14 @@ def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> 
             entry["verdict"] = "stuck_active"
             entry["reason"] = (f"aw-run chain reads active for "
                                f"{_fmt_hours(now - entry['active_since'])} with no PR activity")
+            handoff = True
+        elif unlinked_fix_labels(v, pr):
+            fix_labels = unlinked_fix_labels(v, pr)
+            entry["underlying_verdict"] = verdict
+            entry["verdict"] = "unlinked_fix_needed"
+            entry["reason"] = unlinked_fix_reason(fix_labels, pr.get("head_ref") or "",
+                                                  entry["run_id"])
+            entry.update({"head_ref": pr.get("head_ref") or "", "blocking_labels": fix_labels})
             handoff = True
         elif not handoff and verdict in PASSIVE_VERDICTS and pr.get("stale_labels"):
             # Distinct verdict: the Manager routes it by the preserved badge and
@@ -495,7 +535,9 @@ def manager_prs(store: dict, tagged_keys: "set[str]", now: float) -> "tuple[list
             "attention_reason": (detail if stale_row and detail else
                                  f"aw-run: {reason}" + (f" ({detail})" if detail else "")),
             "aw_run": {"verdict": reason, "run_id": e.get("run_id"),
-                       "wake_count": e.get("wake_count")},
+                       "wake_count": e.get("wake_count"),
+                       **({"head_ref": e.get("head_ref"), "blocking_labels": e.get("blocking_labels")}
+                          if reason == "unlinked_fix_needed" else {})},
         })
     return prs, applied
 
