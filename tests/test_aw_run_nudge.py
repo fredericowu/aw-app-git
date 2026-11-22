@@ -600,3 +600,48 @@ def test_active_timer_resets_when_tagged_run_changes():
     prior["o/r#6"]["run_id"] = RID
     store = aw_run_nudge.plan_nudge_result([_tagged_pr(4)], [_active_v()], prior, NOWT)
     assert store["o/r#6"]["active_since"] == NOWT - 3 * H
+
+
+# ── unlinked PR with blocking findings: fresh-coder handoff ──────────────
+
+def _unlinked_v(**extra):
+    return {"repo": "o/r", "number": 6, "url": "https://github.com/o/r/pull/6",
+            "verdict": "unresolvable", "reason": "run not found for aw-run label", **extra}
+
+
+@pytest.mark.parametrize("label", ["devteam:awaiting-fixes", "devteam:fix-cycle"])
+def test_unlinked_pr_with_blocking_labels_gets_a_fresh_coder_handoff(label):
+    pr = _tagged_pr(0.5, labels=[f"aw-run:{RID}", label], head_ref="feat/x")
+    store = aw_run_nudge.plan_nudge_result([pr], [_unlinked_v()], {}, NOWT)
+    e = store["o/r#6"]
+    assert e["verdict"] == "unlinked_fix_needed" and e["underlying_verdict"] == "unresolvable"
+    assert e["handed_off"] is True and e["head_ref"] == "feat/x" and e["blocking_labels"] == [label]
+    mgr, _ = aw_run_nudge.manager_prs(store, {"o/r#6"}, NOWT)
+    reason = mgr[0]["attention_reason"]
+    assert "fresh coder" in reason and "feat/x" in reason
+    assert "no new PR" in reason and "no /aw-review" in reason and "no merge" in reason
+    assert mgr[0]["aw_run"]["verdict"] == "unlinked_fix_needed"
+    assert mgr[0]["aw_run"]["head_ref"] == "feat/x"
+
+
+def test_unlinked_detected_from_link_resolution_field_too():
+    pr = _tagged_pr(0.5, labels=["devteam:fix-cycle"])
+    v = _unlinked_v(reason="whatever AP-MT words it as", link_resolution="unresolved")
+    assert aw_run_nudge.plan_nudge_result([pr], [v], {}, NOWT)["o/r#6"]["verdict"] == "unlinked_fix_needed"
+
+
+def test_unresolvable_without_blocking_labels_keeps_the_plain_verdict():
+    pr = _tagged_pr(0.5, labels=[f"aw-run:{RID}"])
+    e = aw_run_nudge.plan_nudge_result([pr], [_unlinked_v()], {}, NOWT)["o/r#6"]
+    assert e["verdict"] == "unresolvable" and e["handed_off"] is True
+
+
+def test_other_unresolvable_reasons_with_blocking_labels_are_not_reclassified():
+    pr = _tagged_pr(0.5, labels=["devteam:awaiting-fixes"])
+    v = _unlinked_v(reason="wake dispatch failed: boom")
+    assert aw_run_nudge.plan_nudge_result([pr], [v], {}, NOWT)["o/r#6"]["verdict"] == "unresolvable"
+
+
+def test_live_recheck_carries_head_ref():
+    kept, _, _ = _recheck(_view([f"aw-run:{RID}", "devteam:awaiting-fixes"], headRefName="feat/y"))
+    assert kept[0]["head_ref"] == "feat/y"
