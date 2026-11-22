@@ -65,6 +65,10 @@ ACTIVE_VERDICT_MAX_AGE_S = float(os.environ.get("AW_GIT_ACTIVE_VERDICT_MAX_AGE_S
 #: On a green PR still carrying stale ``devteam:*`` labels they must not hide it.
 PASSIVE_VERDICTS = frozenset({"recent", "waiting_ci", "active"})
 
+#: Verdicts that mean no agent is progressing the PR. ``active`` (a live run in
+#: the chain) is deliberately absent; ``waiting_human`` is a genuine human hold.
+IDLE_OPEN_VERDICTS = frozenset({"recent", "waiting_ci", "ask_failed", "ask_deferred"})
+
 #: Fallback for an AP-MT that predates the per-verdict ``hand_to_manager`` flag.
 #: ``needs_human_label`` is legacy: the ``devteam:needs-human`` PR label is
 #: retired (human-needed state lives on the Kanban card / ``ask_human``), kept
@@ -401,6 +405,11 @@ def unlinked_fix_reason(labels: list, head_ref: str, run_id) -> str:
             "Push to the same branch: no new PR, no /aw-review, no merge")
 
 
+def _age_min(updated_at, now: float) -> "float | None":
+    ts = _parse_ts(updated_at)
+    return None if ts is None else (now - ts) / 60.0
+
+
 def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> dict:
     """Fold fresh verdicts into the persisted store (pure; returns the new
     store). A Manager-bound verdict goes through the SAME surfaced back-off as
@@ -465,6 +474,16 @@ def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> 
             entry.update({"stale_labels": list(pr["stale_labels"]), "badge": pr.get("badge"),
                           "author": pr.get("author"),
                           "author_association": pr.get("author_association")})
+            handoff = True
+        elif (not handoff and verdict in IDLE_OPEN_VERDICTS and not pr.get("is_draft")
+              and (_age_min(pr.get("updated_at"), now) or 0.0) >= gm.IDLE_OPEN_MINUTES):
+            # No run is acting (the chain is idle or waiting on a timer) and the PR
+            # has sat untouched: whatever blocks it, a coder owes it a look.
+            entry["underlying_verdict"] = verdict
+            entry["verdict"] = "idle_open"
+            entry["reason"] = (f"open and untouched {round(_age_min(pr.get('updated_at'), now))}min "
+                               f"(>{gm.IDLE_OPEN_MINUTES:g}min) with no run acting on it "
+                               f"(was {verdict}{': ' + str(v.get('reason')) if v.get('reason') else ''})")
             handoff = True
         if handoff:
             state = gm.surfaced_backoff_state(pr.get("updated_at"), prior.get("stamp"), now)
