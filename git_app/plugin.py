@@ -696,6 +696,18 @@ class GitAppPlugin:
                     aw_run_block["closed_dropped"] = [
                         {"repo": e.get("repo"), "number": e.get("number"), "url": e.get("url")}
                         for e in closed]
+                    # The block was summarised before the live check: keep its
+                    # count in step with ``prs`` and evict the dead PRs' verdicts.
+                    aw_run_block["fallback_attention"] = sum(
+                        1 for e in prs_list if (e.get("aw_run") or {}).get("fallback"))
+                    if not nudge_dry_run:
+                        store_path = aw_run_nudge.default_store_path()
+                        dead = {aw_run_nudge.pr_key(e) for e in closed}
+                        with github_maintenance.locked_store(store_path):
+                            store = aw_run_nudge.load_store(store_path)
+                            if dead & set(store):
+                                aw_run_nudge.save_store(
+                                    store_path, {k: v for k, v in store.items() if k not in dead})
 
             result = {
                 "has_work": bool(prs_list) or bool(failing_flows),

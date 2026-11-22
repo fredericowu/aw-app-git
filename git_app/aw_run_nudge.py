@@ -69,7 +69,12 @@ PASSIVE_VERDICTS = frozenset({"recent", "waiting_ci", "active"})
 #: ``needs_human_label`` is legacy: the ``devteam:needs-human`` PR label is
 #: retired (human-needed state lives on the Kanban card / ``ask_human``), kept
 #: here only so a stray label or an older AP-MT still escalates, never nudges.
-HAND_TO_MANAGER = frozenset({"escalate", "unresolvable", "needs_human_label", "stuck_active"})
+HAND_TO_MANAGER = frozenset({"escalate", "unresolvable", "needs_human_label", "stuck_active",
+                             "awaiting_fixes", "out_of_repo"})
+#: Labels meaning "the pipeline found blocking findings; a coder owes a push".
+#: AP-MT answers ``waiting_human`` (reason null) when a stale ask_human question
+#: is still open on the chain; with one of these labels that is NOT a human hold.
+AWAITING_FIXES_LABELS = ("devteam:awaiting-fixes", "devteam:fix-cycle")
 
 REVIEW_FIELDS = ("state,headRefOid,labels,isDraft,mergeable,mergeStateStatus,statusCheckRollup,"
                  "reviewDecision,updatedAt,headRefName")
@@ -424,6 +429,18 @@ def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> 
                 and prior.get("active_since") else now
         flag = v.get("hand_to_manager")
         handoff = flag if flag is not None else verdict in HAND_TO_MANAGER
+        if verdict == "waiting_human":
+            held = [l for l in AWAITING_FIXES_LABELS if l in (pr.get("labels") or [])]
+            if held:
+                # Not a human hold: the coder owes a push (AP-MT predating its own
+                # awaiting_fixes verdict answers waiting_human with no reason).
+                entry["verdict"] = "awaiting_fixes"
+                entry["reason"] = (f"{held[0]} on the PR; aw-run {entry['run_id']} has an open "
+                                   f"question but findings await a coder push, not a human")
+                handoff = True
+            elif not entry["reason"]:
+                entry["reason"] = (f"open ask_human question on aw-run {entry['run_id']} chain; "
+                                   f"a human was asked")
         if not handoff and active_expired(verdict, entry.get("active_since"), pr.get("updated_at"), now):
             entry["verdict"] = "stuck_active"
             entry["reason"] = (f"aw-run chain reads active for "

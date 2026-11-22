@@ -760,3 +760,26 @@ def test_gate_has_no_work_when_every_surfaced_pr_is_closed(setup):
     app._maintenance._gh_runner = runner
     body = tc.get("/github/maintenance").json()
     assert body["has_work"] is False and body["prs"] == []
+
+
+def test_gate_drops_closed_aw_run_fallback_pr_and_fixes_the_count(setup, tmp_path, monkeypatch):
+    """Cached ``aw_run_attention`` entries (the fallback path) for a PR merged
+    since the scan must not reach the Manager, and ``aw_run.fallback_attention``
+    must match ``prs`` instead of still counting the dead PRs."""
+    from git_app import aw_run_nudge
+    tc, app, _, _ = setup
+    monkeypatch.setattr(aw_run_nudge, "default_store_path", lambda: str(tmp_path / "awrun.json"))
+    tagged = [_pr(number=n, badge=None) for n in (1, 2, 3)]
+    _warm(app)
+    app._maintenance._cache.update({"aw_run_prs": tagged, "aw_run_attention": tagged})
+
+    async def runner(args):
+        import json as _j
+        merged = args[2].endswith(("/1", "/2"))
+        return 0, _j.dumps({"state": "MERGED" if merged else "OPEN", "labels": []}), ""
+
+    app._maintenance._gh_runner = runner
+    body = tc.get("/github/maintenance").json()
+    assert [p["number"] for p in body["prs"]] == [3]
+    assert body["aw_run"]["fallback_attention"] == 1
+    assert sorted(d["number"] for d in body["aw_run"]["closed_dropped"]) == [1, 2]

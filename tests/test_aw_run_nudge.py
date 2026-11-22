@@ -654,3 +654,32 @@ def test_other_unresolvable_reasons_with_blocking_labels_are_not_reclassified():
 def test_live_recheck_carries_head_ref():
     kept, _, _ = _recheck(_view([f"aw-run:{RID}", "devteam:awaiting-fixes"], headRefName="feat/y"))
     assert kept[0]["head_ref"] == "feat/y"
+
+
+@pytest.mark.parametrize("label", ["devteam:awaiting-fixes", "devteam:fix-cycle"])
+def test_waiting_human_with_awaiting_fixes_label_becomes_awaiting_fixes(label):
+    """AP-MT answers waiting_human with reason=null for a stale open question;
+    with a blocking-review label that is a coder lane, not a human hold."""
+    pr = _tagged_pr(3, labels=[label, f"aw-run:{RID}"])
+    v = {**_active_v(), "verdict": "waiting_human"}
+    store = aw_run_nudge.plan_nudge_result([pr], [v], {}, NOWT)
+    e = store["o/r#6"]
+    assert e["verdict"] == "awaiting_fixes" and e["handed_off"] is True
+    assert label in e["reason"] and RID in e["reason"]
+    mgr, _ = aw_run_nudge.manager_prs(store, {"o/r#6"}, NOWT)
+    assert mgr[0]["aw_run"]["verdict"] == "awaiting_fixes" and "None" not in mgr[0]["attention_reason"]
+
+
+def test_genuine_waiting_human_keeps_verdict_but_gets_a_reason():
+    pr = _tagged_pr(3, labels=[f"aw-run:{RID}"])
+    store = aw_run_nudge.plan_nudge_result([pr], [{**_active_v(), "verdict": "waiting_human"}], {}, NOWT)
+    e = store["o/r#6"]
+    assert e["verdict"] == "waiting_human" and e["handed_off"] is False
+    assert e["reason"] and "ask_human" in e["reason"]
+
+
+@pytest.mark.parametrize("verdict", ["awaiting_fixes", "out_of_repo"])
+def test_new_ap_mt_verdicts_hand_to_manager_without_the_flag(verdict):
+    store = aw_run_nudge.plan_nudge_result([_tagged_pr(3)], [{**_active_v(), "verdict": verdict,
+                                                              "reason": "r"}], {}, NOWT)
+    assert store["o/r#6"]["handed_off"] is True
