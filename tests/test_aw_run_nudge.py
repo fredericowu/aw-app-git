@@ -656,7 +656,7 @@ def test_live_recheck_carries_head_ref():
     assert kept[0]["head_ref"] == "feat/y"
 
 
-@pytest.mark.parametrize("label", ["devteam:awaiting-fixes", "devteam:fix-cycle"])
+@pytest.mark.parametrize("label", ["devteam:awaiting-fixes"])
 def test_waiting_human_with_awaiting_fixes_label_becomes_awaiting_fixes(label):
     """AP-MT answers waiting_human with reason=null for a stale open question;
     with a blocking-review label that is a coder lane, not a human hold."""
@@ -668,6 +668,20 @@ def test_waiting_human_with_awaiting_fixes_label_becomes_awaiting_fixes(label):
     assert label in e["reason"] and RID in e["reason"]
     mgr, _ = aw_run_nudge.manager_prs(store, {"o/r#6"}, NOWT)
     assert mgr[0]["aw_run"]["verdict"] == "awaiting_fixes" and "None" not in mgr[0]["attention_reason"]
+
+
+@pytest.mark.parametrize("labels,reason", [
+    (["devteam:fix-cycle", "devteam:needs-human"], None),   # post-push round-two escalation
+    (["devteam:fix-cycle"], None),                          # history label alone
+    (["devteam:awaiting-fixes", "devteam:needs-human"], None),
+    (["devteam:awaiting-fixes"], "wake cap reached"),       # explicit AP-MT escalation
+])
+def test_waiting_human_is_kept_for_history_human_hold_or_explicit_reason(labels, reason):
+    pr = _tagged_pr(3, labels=[*labels, f"aw-run:{RID}"])
+    v = {**_active_v(), "verdict": "waiting_human", "reason": reason}
+    e = aw_run_nudge.plan_nudge_result([pr], [v], {}, NOWT)["o/r#6"]
+    assert e["verdict"] == "waiting_human" and e["handed_off"] is False
+    assert e["reason"] and (reason is None or e["reason"] == reason)
 
 
 def test_genuine_waiting_human_keeps_verdict_but_gets_a_reason():

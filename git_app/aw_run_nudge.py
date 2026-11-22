@@ -74,7 +74,7 @@ HAND_TO_MANAGER = frozenset({"escalate", "unresolvable", "needs_human_label", "s
 #: Labels meaning "the pipeline found blocking findings; a coder owes a push".
 #: AP-MT answers ``waiting_human`` (reason null) when a stale ask_human question
 #: is still open on the chain; with one of these labels that is NOT a human hold.
-AWAITING_FIXES_LABELS = ("devteam:awaiting-fixes", "devteam:fix-cycle")
+AWAITING_FIXES_LABELS = ("devteam:awaiting-fixes",)
 
 REVIEW_FIELDS = ("state,headRefOid,labels,isDraft,mergeable,mergeStateStatus,statusCheckRollup,"
                  "reviewDecision,updatedAt,headRefName")
@@ -431,7 +431,9 @@ def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> 
         handoff = flag if flag is not None else verdict in HAND_TO_MANAGER
         if verdict == "waiting_human":
             held = [l for l in AWAITING_FIXES_LABELS if l in (pr.get("labels") or [])]
-            if held:
+            # Only a reasonless verdict is rewritten: an explicit AP-MT reason (wake
+            # cap, pending ask) is a real escalation, and needs-human is a human hold.
+            if held and not entry["reason"] and NEEDS_HUMAN_LABEL not in (pr.get("labels") or []):
                 # Not a human hold: the coder owes a push (AP-MT predating its own
                 # awaiting_fixes verdict answers waiting_human with no reason).
                 entry["verdict"] = "awaiting_fixes"

@@ -701,13 +701,16 @@ class GitAppPlugin:
                     aw_run_block["fallback_attention"] = sum(
                         1 for e in prs_list if (e.get("aw_run") or {}).get("fallback"))
                     if not nudge_dry_run:
-                        store_path = aw_run_nudge.default_store_path()
-                        dead = {aw_run_nudge.pr_key(e) for e in closed}
-                        with github_maintenance.locked_store(store_path):
-                            store = aw_run_nudge.load_store(store_path)
-                            if dead & set(store):
-                                aw_run_nudge.save_store(
-                                    store_path, {k: v for k, v in store.items() if k not in dead})
+                        try:
+                            store_path = aw_run_nudge.default_store_path()
+                            dead = {aw_run_nudge.pr_key(e) for e in closed}
+                            with github_maintenance.locked_store(store_path):
+                                store = aw_run_nudge.load_store(store_path)
+                                if dead & set(store):
+                                    aw_run_nudge.save_store(
+                                        store_path, {k: v for k, v in store.items() if k not in dead})
+                        except Exception:  # cleanup only: never lose the filtered response
+                            log.exception("verdict-store cleanup for closed PRs failed")
 
             result = {
                 "has_work": bool(prs_list) or bool(failing_flows),

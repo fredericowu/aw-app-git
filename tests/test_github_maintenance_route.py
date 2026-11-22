@@ -783,3 +783,27 @@ def test_gate_drops_closed_aw_run_fallback_pr_and_fixes_the_count(setup, tmp_pat
     assert [p["number"] for p in body["prs"]] == [3]
     assert body["aw_run"]["fallback_attention"] == 1
     assert sorted(d["number"] for d in body["aw_run"]["closed_dropped"]) == [1, 2]
+
+
+def test_gate_survives_verdict_store_cleanup_error(setup, tmp_path, monkeypatch):
+    """A store I/O error while evicting closed PRs must not 500 the gate."""
+    from git_app import aw_run_nudge
+    tc, app, _, _ = setup
+    monkeypatch.setattr(aw_run_nudge, "default_store_path", lambda: str(tmp_path / "awrun.json"))
+
+    def boom(path):
+        raise OSError("lock unavailable")
+
+    monkeypatch.setattr(github_maintenance, "locked_store", boom)
+    tagged = [_pr(number=n, badge=None) for n in (1, 3)]
+    _warm(app)
+    app._maintenance._cache.update({"aw_run_prs": tagged, "aw_run_attention": tagged})
+
+    async def runner(args):
+        import json as _j
+        return 0, _j.dumps({"state": "MERGED" if args[2].endswith("/1") else "OPEN", "labels": []}), ""
+
+    app._maintenance._gh_runner = runner
+    resp = tc.get("/github/maintenance")
+    assert resp.status_code == 200
+    assert [p["number"] for p in resp.json()["prs"]] == [3]
