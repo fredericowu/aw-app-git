@@ -609,8 +609,8 @@ def _unlinked_v(**extra):
             "verdict": "unresolvable", "reason": "run not found for aw-run label", **extra}
 
 
-@pytest.mark.parametrize("label", ["devteam:awaiting-fixes", "devteam:fix-cycle"])
-def test_unlinked_pr_with_blocking_labels_gets_a_fresh_coder_handoff(label):
+def test_unlinked_pr_with_blocking_labels_gets_a_fresh_coder_handoff():
+    label = "devteam:awaiting-fixes"
     pr = _tagged_pr(0.5, labels=[f"aw-run:{RID}", label], head_ref="feat/x")
     store = aw_run_nudge.plan_nudge_result([pr], [_unlinked_v()], {}, NOWT)
     e = store["o/r#6"]
@@ -625,9 +625,18 @@ def test_unlinked_pr_with_blocking_labels_gets_a_fresh_coder_handoff(label):
 
 
 def test_unlinked_detected_from_link_resolution_field_too():
-    pr = _tagged_pr(0.5, labels=["devteam:fix-cycle"])
+    pr = _tagged_pr(0.5, labels=["devteam:awaiting-fixes"])
     v = _unlinked_v(reason="whatever AP-MT words it as", link_resolution="unresolved")
     assert aw_run_nudge.plan_nudge_result([pr], [v], {}, NOWT)["o/r#6"]["verdict"] == "unlinked_fix_needed"
+
+
+@pytest.mark.parametrize("labels", [["devteam:fix-cycle"],
+                                    ["devteam:awaiting-fixes", "devteam:needs-human"],
+                                    ["devteam:fix-cycle", "devteam:needs-human"]])
+def test_unlinked_history_or_human_hold_is_not_a_coder_dispatch(labels):
+    pr = _tagged_pr(0.5, labels=[f"aw-run:{RID}", *labels])
+    e = aw_run_nudge.plan_nudge_result([pr], [_unlinked_v()], {}, NOWT)["o/r#6"]
+    assert e["verdict"] == "unresolvable"
 
 
 def test_unresolvable_without_blocking_labels_keeps_the_plain_verdict():

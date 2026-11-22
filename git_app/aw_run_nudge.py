@@ -76,8 +76,11 @@ REVIEW_FIELDS = ("state,headRefOid,labels,isDraft,mergeable,mergeStateStatus,sta
 
 #: Retired label; read only to tolerate a stray one on an old PR.
 NEEDS_HUMAN_LABEL = "devteam:needs-human"
-#: Labels meaning a review left blocking findings for a coder to fix.
-BLOCKING_FIX_LABELS = ("devteam:awaiting-fixes", "devteam:fix-cycle")
+#: Labels meaning a review left blocking findings on the CURRENT head. The
+#: shared workflow drops ``awaiting-fixes`` on the coder's push and keeps
+#: ``devteam:fix-cycle`` only as round history, so ``fix-cycle`` alone is not a
+#: pending-fix signal.
+BLOCKING_FIX_LABELS = ("devteam:awaiting-fixes",)
 #: AP-MT's ``unresolvable`` reason when the ``aw-run`` label id is unknown to it
 #: (matched only as a fallback for an AP-MT that does not send
 #: ``link_resolution: "unresolved"`` on the verdict).
@@ -377,6 +380,8 @@ def unlinked_fix_labels(verdict: dict, pr: dict) -> "list[str]":
     with findings no one is fixing."""
     if verdict.get("verdict") != "unresolvable":
         return []
+    if NEEDS_HUMAN_LABEL in (pr.get("labels") or []):
+        return []  # human hold takes precedence over a coder dispatch
     unlinked = verdict.get("link_resolution") == "unresolved" \
         or str(verdict.get("reason") or "").startswith(UNLINKED_REASON_PREFIX)
     if not unlinked:
