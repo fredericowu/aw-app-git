@@ -724,3 +724,26 @@ def test_idle_open_does_not_fire_when_something_is_acting(verdict, pr_kw, age):
     pr = _tagged_pr(age, **pr_kw)
     e = aw_run_nudge.plan_nudge_result([pr], [{**_active_v(), "verdict": verdict}], {}, NOWT)["o/r#6"]
     assert e["verdict"] != "idle_open" and e["handed_off"] is False
+
+
+def test_idle_open_keeps_a_pending_human_question_hold():
+    pr = _tagged_pr(0.25)
+    v = {**_active_v(), "verdict": "ask_failed", "question_id": "q1"}
+    e = aw_run_nudge.plan_nudge_result([pr], [v], {}, NOWT)["o/r#6"]
+    assert e["verdict"] != "idle_open"
+
+
+def test_idle_open_uses_live_draft_status_over_cached():
+    live_draft = {**_tagged_pr(0.25), "is_draft": False, "facts": {"draft": True}}
+    e = aw_run_nudge.plan_nudge_result([live_draft], [{**_active_v(), "verdict": "recent"}], {}, NOWT)["o/r#6"]
+    assert e["verdict"] != "idle_open"
+    live_ready = {**_tagged_pr(0.25), "is_draft": True, "facts": {"draft": False}}
+    e = aw_run_nudge.plan_nudge_result([live_ready], [{**_active_v(), "verdict": "recent"}], {}, NOWT)["o/r#6"]
+    assert e["verdict"] == "idle_open"
+
+
+def test_idle_open_zero_threshold_skips_unknown_timestamp(monkeypatch):
+    monkeypatch.setattr(aw_run_nudge.gm, "IDLE_OPEN_MINUTES", 0.0)
+    pr = {**_tagged_pr(0.25), "updated_at": None}
+    e = aw_run_nudge.plan_nudge_result([pr], [{**_active_v(), "verdict": "recent"}], {}, NOWT)["o/r#6"]
+    assert e["verdict"] != "idle_open"

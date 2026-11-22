@@ -475,13 +475,16 @@ def plan_nudge_result(tagged: list, verdicts: list, store: dict, now: float) -> 
                           "author": pr.get("author"),
                           "author_association": pr.get("author_association")})
             handoff = True
-        elif (not handoff and verdict in IDLE_OPEN_VERDICTS and not pr.get("is_draft")
-              and (_age_min(pr.get("updated_at"), now) or 0.0) >= gm.IDLE_OPEN_MINUTES):
+        elif (not handoff and verdict in IDLE_OPEN_VERDICTS
+              and not (pr.get("facts") or {}).get("draft", pr.get("is_draft"))
+              and not (verdict == "ask_failed" and v.get("question_id") is not None)
+              and (age_min := _age_min(pr.get("updated_at"), now)) is not None
+              and age_min >= gm.IDLE_OPEN_MINUTES):
             # No run is acting (the chain is idle or waiting on a timer) and the PR
             # has sat untouched: whatever blocks it, a coder owes it a look.
             entry["underlying_verdict"] = verdict
             entry["verdict"] = "idle_open"
-            entry["reason"] = (f"open and untouched {round(_age_min(pr.get('updated_at'), now))}min "
+            entry["reason"] = (f"open and untouched {round(age_min)}min "
                                f"(>{gm.IDLE_OPEN_MINUTES:g}min) with no run acting on it "
                                f"(was {verdict}{': ' + str(v.get('reason')) if v.get('reason') else ''})")
             handoff = True
