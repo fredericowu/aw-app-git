@@ -734,3 +734,29 @@ def test_publish_overwrites_a_non_finite_on_disk_order(tmp_path, monkeypatch, ba
     asyncio.run(github_maintenance.MaintenanceWatchdog(cache_path=path).poll(order=5.0))
     snap = github_maintenance.load_surfaced_store(path)
     assert snap["order"] == 5.0 and len(snap["prs"]) == 1
+
+
+def test_gate_drops_a_pr_merged_since_the_scan(setup):
+    tc, app, _, _ = setup
+    _warm(app, prs=[_pr(number=1), _pr(number=2)])
+
+    async def runner(args):
+        import json as _j
+        return 0, _j.dumps({"state": "MERGED" if args[2].endswith("/1") else "OPEN"}), ""
+
+    app._maintenance._gh_runner = runner
+    body = tc.get("/github/maintenance").json()
+    assert [p["number"] for p in body["prs"]] == [2]
+    assert body["counts"]["prs"] == 1
+
+
+def test_gate_has_no_work_when_every_surfaced_pr_is_closed(setup):
+    tc, app, _, _ = setup
+    _warm(app, prs=[_pr(number=1)])
+
+    async def runner(args):
+        return 0, '{"state": "CLOSED"}', ""
+
+    app._maintenance._gh_runner = runner
+    body = tc.get("/github/maintenance").json()
+    assert body["has_work"] is False and body["prs"] == []
